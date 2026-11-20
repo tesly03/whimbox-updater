@@ -1,0 +1,4 @@
+# 批处理文件必须保留 CRLF 换行符，否则 Windows cmd.exe 无法执行
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+*.py  text eol=lf
