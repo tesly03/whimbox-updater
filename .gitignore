@@ -1,0 +1,15 @@
+# 运行时生成的数据（本地状态、日志、备份、下载缓存）
+_data/
+
+# Python 缓存
+__pycache__/
+*.pyc
+
+# 下载的安装包/whl（体积大，不入库）
+*.exe
+*.whl
+*.zip
+
+# 系统文件
+Thumbs.db
+.DS_Store
