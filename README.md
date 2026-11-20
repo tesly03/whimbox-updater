@@ -14,9 +14,20 @@
 
 只依赖 Python 标准库，直接用奇想盒自带的内置 Python 运行，无需额外安装。
 
-## 快速开始
+## 快速开始（解压即用）
 
-把整个文件夹放到奇想盒安装目录下（例如 `C:\Program Files\whimbox_app\whimbox-updater\`），然后双击：
+1. 到本仓库 **Releases** 下载最新的 `whimbox-updater-vX.Y.Z.zip`。
+2. 解压到奇想盒安装目录内的任意一个文件夹，例如：
+
+   ```
+   C:\Program Files\whimbox_app\whimbox-updater\
+   ```
+
+   路径会自动推断：脚本会从自身所在位置向上查找奇想盒安装根目录
+   （识别 `python-embedded\` 与 `resources\app.asar`），**无需修改任何配置**。
+   即使奇想盒装在 D 盘等非默认位置也能直接使用。
+
+3. 双击对应的 bat 即可：
 
 | 文件 | 作用 |
 |---|---|
@@ -56,7 +67,7 @@ python whimbox_updater.py --help               # 查看全部参数
 
 ## 配置
 
-需要改的路径/参数都在 `whimbox_updater.py` 顶部的「配置区」：
+路径已经全部自动推断，一般**无需改动**。需要调整的参数在 `whimbox_updater.py` 顶部「配置区」：
 
 - `APP_DIR` — 奇想盒安装目录（默认 `C:\Program Files\whimbox_app`）
 - `PROXIES` — GitHub 镜像通道列表（默认已按可用性排序）

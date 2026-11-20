@@ -4,11 +4,20 @@
 
 $ErrorActionPreference = 'Stop'
 
-$py     = 'C:\Program Files\whimbox_app\python-embedded\python.exe'
+# 自动推断奇想盒内置 Python：从脚本所在位置向上找 python-embedded\python.exe
+$py     = $null
+$dir    = $PSScriptRoot
+for ($i = 0; $i -lt 5; $i++) {
+    $candidate = Join-Path $dir 'python-embedded\python.exe'
+    if (Test-Path $candidate) { $py = $candidate; break }
+    $parent = Split-Path $dir -Parent
+    if (-not $parent -or $parent -eq $dir) { break }
+    $dir = $parent
+}
 $script = Join-Path $PSScriptRoot 'whimbox_updater.py'
 $taskName = 'WhimboxAutoUpdate'
 
-if (-not (Test-Path $py))     { throw "Embedded Python not found: $py" }
+if (-not $py)     { throw "Embedded Python not found (向上未找到 python-embedded\python.exe). 请把本文件夹放在奇想盒安装目录内。" }
 if (-not (Test-Path $script)) { throw "Updater script not found: $script" }
 
 # Change 09:00 to whatever time you prefer.

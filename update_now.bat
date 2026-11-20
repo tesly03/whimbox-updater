@@ -1,14 +1,28 @@
 @echo off
 chcp 65001 >nul
 title Whimbox Auto Update
-set "PY=C:\Program Files\whimbox_app\python-embedded\python.exe"
+setlocal
+
+set "DIR=%~dp0"
+:findpy_update
+if exist "%DIR%python-embedded\python.exe" (
+  set "PY=%DIR%python-embedded\python.exe"
+  goto :run_update
+)
+set "PARENT=%DIR%..\"
+for %%P in ("%DIR%.") do set "PARENT=%%~dpP"
+if /i "%PARENT%"=="%DIR%" goto :run_update
+set "DIR=%PARENT%"
+goto :findpy_update
+
+:run_update
 if not exist "%PY%" (
-  echo [ERROR] Embedded Python not found: %PY%
-  echo Please edit PY in this .bat to match your Whimbox install path.
+  echo [ERROR] 未找到奇想盒内置 Python：python-embedded\python.exe
+  echo 请把本文件夹解压到奇想盒安装目录内，例如 C:\Program Files\whimbox_app\whimbox-updater
   pause
   exit /b 1
 )
 "%PY%" "%~dp0whimbox_updater.py" %*
 echo.
-echo ---- finished, press any key to close ----
+echo ---- 完成，按任意键关闭 ----
 pause >nul

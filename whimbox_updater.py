@@ -42,7 +42,26 @@ from datetime import datetime
 import urllib.request
 
 # ---------------------------------------------------------------- 配置区
-APP_DIR = r"C:\Program Files\whimbox_app"
+DEFAULT_APP_DIR = r"C:\Program Files\whimbox_app"
+
+
+def _detect_app_dir():
+    """自动推断奇想盒安装目录：从脚本所在位置逐级向上找，
+    命中「同时含 python-embedded 与 resources\app.asar」的目录即视为安装根目录。
+    这样把本文件夹解压到任意位置的奇想盒目录下都能直接使用，无需改配置。"""
+    cur = os.path.dirname(os.path.abspath(__file__))
+    for _ in range(5):
+        if (os.path.isdir(os.path.join(cur, "python-embedded"))
+                and os.path.exists(os.path.join(cur, "resources", "app.asar"))):
+            return cur
+        parent = os.path.dirname(cur)
+        if parent == cur:
+            break
+        cur = parent
+    return DEFAULT_APP_DIR
+
+
+APP_DIR = _detect_app_dir()
 PY_EXE = os.path.join(APP_DIR, "python-embedded", "python.exe")
 SITE_PACKAGES = os.path.join(APP_DIR, "python-embedded", "Lib", "site-packages")
 ASAR = os.path.join(APP_DIR, "resources", "app.asar")
