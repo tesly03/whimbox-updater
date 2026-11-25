@@ -1164,22 +1164,32 @@ def check_wheel_dependencies(wheel_path):
         "    try:\n"
         "        installed = m.version(req.name)\n"
         "    except m.PackageNotFoundError:\n"
-        "        issues.append(f'{raw} (未安装)')\n"
+        "        issues.append([raw, None])\n"
         "        continue\n"
         "    if req.specifier and not req.specifier.contains(installed, prereleases=True):\n"
-        "        issues.append(f'{raw} (当前 {installed})')\n"
-        "print(json.dumps(issues, ensure_ascii=False))\n"
+        "        issues.append([raw, installed])\n"
+        "print(json.dumps(issues, ensure_ascii=True))\n"
     )
     try:
         process = subprocess.run(
-            [PY_EXE, "-s", "-c", probe, json.dumps(requires, ensure_ascii=False)],
+            [PY_EXE, "-s", "-c", probe, json.dumps(requires, ensure_ascii=True)],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=45, env=env_for_pip(),
         )
         if process.returncode != 0:
             return None
         parsed = json.loads((process.stdout or "").strip().splitlines()[-1])
-        return parsed if isinstance(parsed, list) else None
+        if not isinstance(parsed, list):
+            return None
+        formatted = []
+        for item in parsed:
+            if isinstance(item, list) and len(item) == 2:
+                raw_req, cur_ver = item
+                if cur_ver is None:
+                    formatted.append("%s (未安装)" % raw_req)
+                else:
+                    formatted.append("%s (当前 %s)" % (raw_req, cur_ver))
+        return formatted
     except (OSError, ValueError, IndexError, subprocess.TimeoutExpired):
         return None
 
