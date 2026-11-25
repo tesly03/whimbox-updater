@@ -19,7 +19,7 @@ $requiredFiles = @(
     (Join-Path $repo '.github/workflows/windows-release.yml')
 )
 $entryNames = @(
-    'run_updater.bat', 'update_now.bat', 'update_frontend.bat', 'check_only.bat', 'rollback.bat',
+    'run_updater.bat', 'update_now.bat', 'update_all.bat', 'update_frontend.bat', 'check_only.bat', 'rollback.bat',
     'subscriptions.bat', 'install_task.bat', 'install_task.ps1'
 )
 
@@ -81,7 +81,47 @@ New-Item -ItemType Directory -Path $out -Force | Out-Null
 $work = Join-Path $out '.build'
 $dist = Join-Path $work 'dist'
 New-Item -ItemType Directory -Path $work -Force | Out-Null
+
+$vParts = $Version.Split('.')
+$vTuple = "$($vParts[0]), $($vParts[1]), $($vParts[2]), 0"
+$versionInfoPath = Join-Path $work 'version_info.txt'
+$versionInfoContent = @"
+VSVersionInfo(
+  ffi=FixedFileInfo(
+    filevers=($vTuple),
+    prodvers=($vTuple),
+    mask=0x3f,
+    flags=0x0,
+    OS=0x40004,
+    fileType=0x1,
+    subtype=0x0,
+    date=(0, 0)
+  ),
+  kids=[
+    StringFileInfo([
+      StringTable(
+        '040904B0',
+        [
+          StringStruct('CompanyName', 'whimbox-updater'),
+          StringStruct('FileDescription', 'Whimbox Updater'),
+          StringStruct('FileVersion', '$Version.0'),
+          StringStruct('InternalName', 'whimbox-updater'),
+          StringStruct('OriginalFilename', 'whimbox-updater.exe'),
+          StringStruct('ProductName', 'Whimbox Updater'),
+          StringStruct('ProductVersion', '$Version')
+        ]
+      )
+    ]),
+    VarFileInfo([VarStruct('Translation', [1033, 1200])])
+  ]
+)
+"@
+[System.IO.File]::WriteAllText($versionInfoPath, $versionInfoContent, [System.Text.Encoding]::ASCII)
+
 & python -m PyInstaller --clean --noconfirm --onefile --console --name 'whimbox-updater' `
+    --version-file $versionInfoPath `
+    --exclude-module tkinter --exclude-module _tkinter --exclude-module unittest `
+    --exclude-module sqlite3 --exclude-module pydoc --exclude-module doctest `
     --distpath $dist --workpath (Join-Path $work 'work') --specpath $work $source
 if ($LASTEXITCODE -ne 0) { throw "PyInstaller failed with exit code $LASTEXITCODE" }
 
@@ -90,15 +130,16 @@ if (-not (Test-Path -LiteralPath $builtExe -PathType Leaf)) {
     throw 'PyInstaller did not produce whimbox-updater.exe'
 }
 
-$portable = Join-Path $work 'portable'
-if (Test-Path -LiteralPath $portable) { Remove-Item -LiteralPath $portable -Recurse -Force }
-New-Item -ItemType Directory -Path $portable | Out-Null
+$portableRoot = Join-Path $work 'portable'
+if (Test-Path -LiteralPath $portableRoot) { Remove-Item -LiteralPath $portableRoot -Recurse -Force }
+$portable = Join-Path $portableRoot 'whimbox-updater'
+New-Item -ItemType Directory -Path $portable -Force | Out-Null
 Copy-Item -LiteralPath $builtExe -Destination (Join-Path $portable 'whimbox-updater.exe')
 foreach ($name in @('README.md', 'LICENSE', 'CHANGELOG.md') + $entryNames) {
     Copy-Item -LiteralPath (Join-Path $repo $name) -Destination $portable
 }
 $portableZip = Join-Path $out "whimbox-updater-v$Version-windows-x64.zip"
-New-ReleaseArchive -Directory $portable -Destination $portableZip
+New-ReleaseArchive -Directory $portableRoot -Destination $portableZip
 
 $sourceStage = Join-Path $work 'source'
 if (Test-Path -LiteralPath $sourceStage) { Remove-Item -LiteralPath $sourceStage -Recurse -Force }

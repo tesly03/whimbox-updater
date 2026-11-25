@@ -96,8 +96,10 @@ class UpdaterTestCase(unittest.TestCase):
         updater._LOG_PATH = None
         updater._DIRECT_ONLY = False
         updater._CUSTOM_PROXIES = None
+        updater._FAILED_PROXIES.clear()
 
     def tearDown(self):
+        updater._FAILED_PROXIES.clear()
         for name, value in self._globals.items():
             setattr(updater, name, value)
         self.temp.cleanup()
@@ -624,12 +626,12 @@ class UpdaterTestCase(unittest.TestCase):
         self.assertEqual(got_cached[0]["tag_name"], "v3.1.5")
         self.assertEqual(seen_second[0][1].get("If-none-match"), '"etag-v1"')
 
-        # When direct API fails and proxies are used, Authorization header MUST NOT be sent.
+        # When direct GitHub fails and proxies are used, Authorization header MUST NOT be sent.
         proxy_requests = []
 
         def proxy_only_urlopen(req, timeout=20):
             proxy_requests.append((req.full_url, dict(req.header_items())))
-            if req.full_url == updater.RELEASES_API:
+            if req.full_url.startswith("https://api.github.com/") or req.full_url.startswith("https://github.com/"):
                 raise OSError("direct blocked")
             return _MockHTTPResponse(json.dumps(releases_payload).encode("utf-8"))
 
@@ -637,9 +639,16 @@ class UpdaterTestCase(unittest.TestCase):
                 mock.patch.object(updater.urllib.request, "urlopen", side_effect=proxy_only_urlopen):
             got_proxy = updater.fetch_releases()
         self.assertEqual(got_proxy[0]["tag_name"], "v3.1.5")
-        proxy_calls = [hdrs for url, hdrs in proxy_requests if url != updater.RELEASES_API]
+        non_api_calls = [
+            hdrs for url, hdrs in proxy_requests
+            if not url.startswith("https://api.github.com/")
+        ]
+        proxy_calls = [
+            hdrs for url, hdrs in proxy_requests
+            if not url.startswith("https://api.github.com/") and not url.startswith("https://github.com/")
+        ]
         self.assertEqual(len(proxy_calls), 2)
-        for hdrs in proxy_calls:
+        for hdrs in non_api_calls:
             self.assertNotIn("Authorization", hdrs)
 
     def test_fetch_releases_proxy_consensus_rejects_mismatched_digest(self):
@@ -648,7 +657,7 @@ class UpdaterTestCase(unittest.TestCase):
         call_num = {"n": 0}
 
         def tampered_urlopen(req, timeout=20):
-            if req.full_url == updater.RELEASES_API:
+            if req.full_url.startswith("https://api.github.com/") or req.full_url.startswith("https://github.com/"):
                 raise OSError("direct blocked")
             call_num["n"] += 1
             payload = rel_a if call_num["n"] == 1 else rel_b
@@ -874,6 +883,395 @@ class UpdaterTestCase(unittest.TestCase):
         sync.assert_not_called()
         fe_install.assert_called_once()
         self.assertEqual(dl.call_count, 1)
+
+    # ------------------------------------------------------------------
+    # New v1.3.0 resilience, process guard, dependency, and script tests
+    # ------------------------------------------------------------------
+    def test_fetch_releases_falls_back_to_direct_atom_and_expanded_assets_on_api_403(self):
+        atom_xml = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<feed xmlns="http://www.w3.org/2005/Atom">'
+            '<entry>'
+            '<link rel="alternate" href="https://github.com/nikkigallery/Whimbox/releases/tag/3.1.5"/>'
+            '<title>3.1.5 修复已知bug</title>'
+            '<updated>2026-11-11T08:27:07Z</updated>'
+            '<content type="html">&lt;p&gt;1.修复&amp;amp;优化&lt;br&gt;2.第二行&lt;/p&gt;</content>'
+            '</entry>'
+            '<entry>'
+            '<link rel="alternate" href="https://github.com/nikkigallery/Whimbox/releases/tag/3.1.4"/>'
+            '<title>3.1.4</title>'
+            '<updated>2026-11-07T08:10:57Z</updated>'
+            '<content type="html">&lt;p&gt;前端更新&lt;/p&gt;</content>'
+            '</entry>'
+            '</feed>'
+        ).encode("utf-8")
+        whl_sha = "a" * 64
+        exe_sha = "b" * 64
+        assets_315 = (
+            '<ul><li>'
+            '<a href="/nikkigallery/Whimbox/releases/download/3.1.5/whimbox-3.1.5-py3-none-any.whl">whl</a>'
+            f'<span>sha256:{whl_sha}</span>'
+            '</li></ul>'
+        ).encode("utf-8")
+        assets_314 = (
+            '<ul><li>'
+            '<a href="/nikkigallery/Whimbox/releases/download/3.1.4/whimbox_app-setup-3.1.4.exe">exe</a>'
+            f'<span>sha256:{exe_sha}</span>'
+            '</li></ul>'
+        ).encode("utf-8")
+        seen = []
+
+        def fake_urlopen(req, timeout=20):
+            seen.append((req.full_url, dict(req.header_items())))
+            if req.full_url == updater.RELEASES_API:
+                raise urllib.error.HTTPError(req.full_url, 403, "rate limit", {}, None)
+            if req.full_url == updater.RELEASES_ATOM_URL:
+                return _MockHTTPResponse(atom_xml, headers={"ETag": '"atom-e1"'})
+            if req.full_url.endswith("/expanded_assets/3.1.5"):
+                return _MockHTTPResponse(assets_315)
+            if req.full_url.endswith("/expanded_assets/3.1.4"):
+                return _MockHTTPResponse(assets_314)
+            raise AssertionError("Unexpected URL: " + req.full_url)
+
+        with mock.patch.dict(os.environ, {"GITHUB_TOKEN": "top-secret"}, clear=False), \
+                mock.patch.object(updater.urllib.request, "urlopen", side_effect=fake_urlopen):
+            rels = updater.fetch_releases()
+        _, whl, wver = updater.pick_asset(rels, ".whl", updater._WHL_PATTERNS)
+        _, exe, ever = updater.pick_asset(rels, ".exe", updater._EXE_PATTERNS)
+        self.assertEqual(wver, "3.1.5")
+        self.assertEqual(updater.asset_digest(whl), whl_sha)
+        self.assertIsNone(whl["size"])
+        self.assertEqual(ever, "3.1.4")
+        self.assertEqual(updater.asset_digest(exe), exe_sha)
+        notes = updater._summarize_release_notes(rels[0]["body"])
+        self.assertEqual(notes, ["1.修复&优化", "2.第二行"])
+        # Authorization header must never be sent to github.com web endpoints.
+        for url, hdrs in seen:
+            if not url.startswith("https://api.github.com/"):
+                self.assertNotIn("Authorization", hdrs)
+
+    def test_fetch_releases_cross_proxy_api_plus_web_consensus_and_circuit_breaker(self):
+        sha = "c" * 64
+        api_rel = self.release("3.1.5", digest=sha)
+        api_rel[0]["tag_name"] = "3.1.5"
+        assets_html = (
+            '<ul><li>'
+            '<a href="/nikkigallery/Whimbox/releases/download/3.1.5/whimbox-3.1.5-py3-none-any.whl">whl</a>'
+            f'<span>sha256:{sha}</span>'
+            '</li></ul>'
+        ).encode("utf-8")
+
+        def fake_urlopen(req, timeout=20):
+            url = req.full_url
+            if url.startswith("https://api.github.com/") or url.startswith("https://github.com/"):
+                raise OSError("direct blocked")
+            if url.startswith("https://dead.example/"):
+                raise TimeoutError("dead proxy timeout")
+            if url == "https://gh-proxy.org/" + updater.RELEASES_API:
+                return _MockHTTPResponse(json.dumps(api_rel).encode("utf-8"))
+            if url == "https://ghfast.top/" + updater.RELEASES_API:
+                # 403 endpoint restriction must NOT trip circuit breaker!
+                raise urllib.error.HTTPError(url, 403, "Invalid input", {}, None)
+            if url == "https://ghfast.top/" + updater.RELEASES_EXPANDED_ASSETS_PREFIX + "3.1.5":
+                return _MockHTTPResponse(assets_html)
+            raise urllib.error.HTTPError(url, 404, "Not found", {}, None)
+
+        updater._CUSTOM_PROXIES = ["https://dead.example/", "https://gh-proxy.org/", "https://ghfast.top/", ""]
+        with mock.patch.object(updater.urllib.request, "urlopen", side_effect=fake_urlopen):
+            rels = updater.fetch_releases()
+        self.assertEqual(rels[0]["tag_name"], "3.1.5")
+        self.assertIn("https://dead.example/", updater._FAILED_PROXIES)
+        self.assertNotIn("https://ghfast.top/", updater._FAILED_PROXIES)
+        self.assertNotIn("https://dead.example/", updater._active_proxies())
+
+    def test_fetch_scripts_commit_falls_back_to_git_smart_http_refs(self):
+        sha = "e1e9d329fb2f47be3eb924457d756302afb70acc"
+        pkt = f"001e# service=git-upload-pack\n00000040{sha} HEAD\x00multi_ack\n003f{sha} refs/heads/main\n0000".encode("utf-8")
+
+        def fake_urlopen(req, timeout=10):
+            if req.full_url == updater.SCRIPTS_COMMIT_API:
+                raise urllib.error.HTTPError(req.full_url, 403, "rate limit", {}, None)
+            if req.full_url == updater.SCRIPTS_GIT_REFS_URL:
+                return _MockHTTPResponse(pkt)
+            raise AssertionError("Unexpected URL: " + req.full_url)
+
+        with mock.patch.object(updater.urllib.request, "urlopen", side_effect=fake_urlopen):
+            got_sha, got_etag = updater.fetch_scripts_commit()
+        self.assertEqual(got_sha, sha)
+        self.assertIsNone(got_etag)
+
+    def test_orphan_backend_auto_cleanup_vs_active_frontend_protection(self):
+        py_path = str(Path(updater.PY_EXE))
+        fe_path = str(self.app / "whimbox_app.exe")
+        orphan_only = [(5678, "python.exe", py_path)]
+        active_fe = [(1234, "whimbox_app.exe", fe_path), (5678, "python.exe", py_path)]
+
+        # 1. Orphan backend only: auto-cleaned by default.
+        with mock.patch.object(updater, "find_running_whimbox_processes", side_effect=[orphan_only, []]), \
+                mock.patch.object(updater, "_terminate_windows_processes", return_value=[]) as term, \
+                mock.patch.object(updater.time, "sleep"):
+            updater._ensure_whimbox_not_running(stop_orphans=True, stop_running=False)
+        term.assert_called_once_with(orphan_only)
+
+        # 2. Orphan backend with --no-kill-orphan-backend: raises cleanly without killing.
+        with mock.patch.object(updater, "find_running_whimbox_processes", return_value=orphan_only), \
+                mock.patch.object(updater, "_terminate_windows_processes") as term:
+            with self.assertRaises(RuntimeError):
+                updater._ensure_whimbox_not_running(stop_orphans=False, stop_running=False)
+        term.assert_not_called()
+
+        # 3. Active frontend: blocked unless --stop-running is explicitly set.
+        with mock.patch.object(updater, "find_running_whimbox_processes", return_value=active_fe), \
+                mock.patch.object(updater, "_terminate_windows_processes") as term:
+            with self.assertRaises(RuntimeError) as ctx:
+                updater._ensure_whimbox_not_running(stop_orphans=True, stop_running=False)
+        self.assertIn("--stop-running", str(ctx.exception))
+        term.assert_not_called()
+
+        # 4. Active frontend with --stop-running: terminates both frontend and backend.
+        with mock.patch.object(updater, "find_running_whimbox_processes", side_effect=[active_fe, []]), \
+                mock.patch.object(updater, "_terminate_windows_processes", return_value=[]) as term, \
+                mock.patch.object(updater.time, "sleep"):
+            updater._ensure_whimbox_not_running(stop_orphans=True, stop_running=True)
+        term.assert_called_once_with(active_fe)
+
+    def test_fresh_install_auto_enables_sync_deps_and_preflight_blocks_missing_deps(self):
+        # 1. Fresh install (bver == "unknown") automatically sets sync_deps=True.
+        wheel_name = "whimbox-3.1.5-py3-none-any.whl"
+        with mock.patch.object(updater, "backend_version", side_effect=["unknown", "3.1.5"]), \
+                mock.patch.object(updater, "frontend_version", return_value="3.1.4"), \
+                mock.patch.object(updater, "fetch_releases", return_value=self.release("3.1.5")), \
+                mock.patch.object(updater, "download_asset", return_value="3.1.5"), \
+                mock.patch.object(updater, "backup_backend", return_value=str(self.root / "bkp")), \
+                mock.patch.object(updater, "install_whl", return_value=True) as install:
+            rc = self.run_main(["--no-elevate", "--no-scripts"])
+        self.assertEqual(rc, 0)
+        install.assert_called_once_with(
+            os.path.join(updater.DOWNLOAD_DIR, wheel_name), force=False, sync_deps=True
+        )
+
+        # 2. Existing install with pre-flight missing dependencies stops BEFORE backup_backend.
+        with mock.patch.object(updater, "backend_version", return_value="3.1.4"), \
+                mock.patch.object(updater, "frontend_version", return_value="3.1.4"), \
+                mock.patch.object(updater, "fetch_releases", return_value=self.release("3.1.5")), \
+                mock.patch.object(updater, "download_asset", return_value="3.1.5"), \
+                mock.patch.object(updater, "check_wheel_dependencies", return_value=["watchdog==6.0.0 (未安装)"]), \
+                mock.patch.object(updater, "backup_backend") as backup, \
+                mock.patch.object(updater, "install_whl") as install:
+            rc = self.run_main(["--no-elevate", "--no-scripts"])
+        self.assertEqual(rc, 1)
+        backup.assert_not_called()
+        install.assert_not_called()
+
+    def test_differential_pip_check_ignores_preexisting_unrelated_warnings_but_blocks_new(self):
+        pre_warn = "unrelated-pkg 1.0 requires foo>=2.0, which is not installed."
+
+        # Pre-existing unrelated warning only: should NOT fail install.
+        def run_preexisting_only(args, timeout=600, cwd=None):
+            if args[-1] == "check":
+                return False, pre_warn
+            return True, "ok"
+
+        with mock.patch.object(updater, "run_cmd", side_effect=run_preexisting_only):
+            self.assertTrue(updater.install_whl("fixture.whl"))
+
+        # Newly introduced warning after install: MUST fail install.
+        check_calls = {"n": 0}
+
+        def run_new_issue(args, timeout=600, cwd=None):
+            if args[-1] == "check":
+                check_calls["n"] += 1
+                if check_calls["n"] == 1:
+                    return False, pre_warn
+                return False, pre_warn + "\nother-pkg 2.0 requires bar==1.0, which is not installed."
+            return True, "ok"
+
+        with mock.patch.object(updater, "run_cmd", side_effect=run_new_issue):
+            self.assertFalse(updater.install_whl("fixture.whl"))
+
+    def test_fast_backend_version_reads_single_dist_info_without_spawning_python(self):
+        self.make_package("3.1.5", "ok")
+        with mock.patch.object(updater.subprocess, "run", side_effect=AssertionError("should use fast path")):
+            self.assertEqual(updater.backend_version(), "3.1.5")
+
+    def test_download_asset_supports_http_206_range_resume_and_prunes_old_part_files(self):
+        wheel_src = self.root / "resume.whl"
+        wheel_bytes = _build_wheel(wheel_src, version="3.1.5")
+        wheel_sha = hashlib.sha256(wheel_bytes).hexdigest()
+        official_url = "https://github.com/nikkigallery/Whimbox/releases/download/3.1.5/whimbox-3.1.5-py3-none-any.whl"
+        dest = self.data / "downloads" / "whimbox-3.1.5-py3-none-any.whl"
+        split_at = len(wheel_bytes) // 2
+
+        class _DroppingResponse:
+            status = 200
+            headers = {}
+
+            def __init__(self, first_part: bytes):
+                self._sent = False
+                self._part = first_part
+
+            def read(self, size=-1):
+                if not self._sent:
+                    self._sent = True
+                    return self._part
+                raise TimeoutError("mid-stream drop")
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                pass
+
+        seen_ranges = []
+
+        def fake_urlopen(req, timeout=20):
+            rng = dict(req.header_items()).get("Range")
+            seen_ranges.append(rng)
+            if len(seen_ranges) == 1:
+                return _DroppingResponse(wheel_bytes[:split_at])
+            self.assertEqual(rng, f"bytes={split_at}-")
+            return _MockHTTPResponse(
+                wheel_bytes[split_at:],
+                headers={"Content-Range": f"bytes {split_at}-{len(wheel_bytes) - 1}/{len(wheel_bytes)}"},
+                status=206,
+            )
+
+        updater._CUSTOM_PROXIES = ["https://mirror-a.example/", "https://mirror-b.example/", ""]
+        with mock.patch.object(updater.urllib.request, "urlopen", side_effect=fake_urlopen):
+            ver = updater.download_asset(official_url, str(dest), len(wheel_bytes), wheel_sha, is_whl=True)
+        self.assertEqual(ver, "3.1.5")
+        self.assertEqual(dest.read_bytes(), wheel_bytes)
+        self.assertEqual(len(seen_ranges), 2)
+
+        # Stale .part files older than PART_KEEP_DAYS are pruned.
+        stale_part = self.data / "downloads" / ".deadbeef12345678.part"
+        stale_part.write_bytes(b"stale")
+        old_ts = (datetime.now() - timedelta(days=updater.PART_KEEP_DAYS + 2)).timestamp()
+        os.utime(stale_part, (old_ts, old_ts))
+        updater._prune_downloads()
+        self.assertFalse(stale_part.exists())
+
+    def test_script_sync_matches_info_name_targeted_raw_and_archives_upstream_removed(self):
+        # 1. Matching by UI info.name and bare stem.
+        s1 = json.dumps({"info": {"name": "祈愿树林 星荧草", "type": "采集"}}).encode("utf-8")
+        s2 = json.dumps({"info": {"name": "家园日常", "type": "综合"}}).encode("utf-8")
+        remote = {"星荧草_祈愿树林_27_随缘.json": s1, "家园日常.json": s2}
+        matched, missing = updater._match_wanted_scripts(remote, ["祈愿树林 星荧草", "家园日常"])
+        self.assertEqual(set(matched.keys()), {"星荧草_祈愿树林_27_随缘.json", "家园日常.json"})
+        self.assertEqual(missing, set())
+
+        # 2. Targeted raw download skips full zip archive for small filename watchlists.
+        sha = "1" * 40
+        with mock.patch.object(updater, "fetch_scripts_commit", return_value=(sha, None)), \
+                mock.patch.object(updater.urllib.request, "urlopen", return_value=_MockHTTPResponse(s2)), \
+                mock.patch.object(updater, "download_scripts_archive", side_effect=AssertionError("should use targeted raw")):
+            counts = updater.sync_scripts(only=["家园日常.json"])
+        self.assertEqual(counts["added"], 1)
+        self.assertTrue((Path(updater.SCRIPTS_DIR) / "家园日常.json").is_file())
+
+        # 3. Full sync archives unmodified upstream-removed scripts but preserves user-modified ones.
+        r1 = {"keep.json": s1, "old_unmodified.json": s2, "old_edited.json": s2}
+        with mock.patch.object(updater, "fetch_scripts_commit", return_value=("a" * 40, None)), \
+                mock.patch.object(updater, "download_scripts_archive", return_value=r1):
+            updater.sync_scripts()
+        # User modifies old_edited.json locally.
+        (Path(updater.SCRIPTS_DIR) / "old_edited.json").write_bytes(b'{"info": {"name": "custom"}}')
+        # Upstream removes both old_unmodified.json and old_edited.json.
+        with mock.patch.object(updater, "fetch_scripts_commit", return_value=("b" * 40, None)), \
+                mock.patch.object(updater, "download_scripts_archive", return_value={"keep.json": s1}):
+            counts2 = updater.sync_scripts()
+        self.assertEqual(counts2["removed"], 1)
+        self.assertFalse((Path(updater.SCRIPTS_DIR) / "old_unmodified.json").exists())
+        self.assertTrue((Path(updater.SCRIPTS_DIR) / "old_edited.json").is_file())
+        self.assertTrue((Path(updater.SCRIPTS_DIR) / "keep.json").is_file())
+
+    def test_entrypoint_quiet_and_help_skip_pause_and_parser_disables_abbrev(self):
+        # --quiet suppresses --pause.
+        with mock.patch.object(updater.sys, "argv", ["updater.exe", "--quiet", "--pause"]), \
+                mock.patch.object(updater, "main", return_value=0), \
+                mock.patch("builtins.input", return_value="") as pause:
+            self.assertEqual(updater.entrypoint(), 0)
+        pause.assert_not_called()
+
+        # --help with --pause suppresses pause cleanly.
+        with mock.patch.object(updater.sys, "argv", ["updater.exe", "--help", "--pause"]), \
+                mock.patch("builtins.input", return_value="") as pause, \
+                contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(updater.entrypoint(), 0)
+        pause.assert_not_called()
+
+        # allow_abbrev=False rejects truncated flags like --edit-sub.
+        with contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as raised:
+                updater._parser().parse_args(["--edit-sub"])
+        self.assertNotEqual(raised.exception.code, 0)
+
+    def test_install_frontend_isolates_env_and_uses_download_cwd(self):
+        exe = self.data / "downloads" / "whimbox_app-setup-3.1.4.exe"
+        exe.parent.mkdir(parents=True, exist_ok=True)
+        exe.write_bytes(b"mock-installer")
+        captured = {}
+
+        def fake_run(cmd, timeout=420, env=None, cwd=None):
+            captured["env"] = env
+            captured["cwd"] = cwd
+            return mock.Mock(returncode=0)
+
+        with mock.patch.dict(os.environ, {"_MEIPASS": "/tmp/pyi", "PYTHONHOME": "/tmp/py"}, clear=False), \
+                mock.patch.object(updater.subprocess, "run", side_effect=fake_run), \
+                mock.patch.object(updater, "frontend_version", return_value="3.1.4"):
+            self.assertTrue(updater.install_frontend(str(exe), "3.1.4"))
+        self.assertEqual(Path(captured["cwd"]), exe.parent)
+        self.assertNotIn("_MEIPASS", captured["env"])
+        self.assertNotIn("PYTHONHOME", captured["env"])
+
+    def test_check_self_update_and_list_scripts(self):
+        self_atom = (
+            '<?xml version="1.0" encoding="UTF-8"?>'
+            '<feed xmlns="http://www.w3.org/2005/Atom">'
+            '<entry>'
+            '<link rel="alternate" href="https://github.com/tesly03/whimbox-updater/releases/tag/v9.9.9"/>'
+            '<title>v9.9.9</title><updated>2026-12-01T00:00:00Z</updated>'
+            '</entry></feed>'
+        ).encode("utf-8")
+        with mock.patch.object(updater.urllib.request, "urlopen", return_value=_MockHTTPResponse(self_atom)):
+            self.assertEqual(self.run_main(["--check-self"]), 0)
+
+        sample_scripts = {"星荧草_祈愿树林_27_随缘.json": json.dumps({"info": {"name": "祈愿树林 星荧草", "type": "采集"}}).encode("utf-8")}
+        buf = io.StringIO()
+        with mock.patch.object(updater, "download_scripts_archive", return_value=sample_scripts), \
+                contextlib.redirect_stdout(buf):
+            self.assertEqual(self.run_main(["--list-scripts"]), 0)
+        self.assertIn("祈愿树林 星荧草", buf.getvalue())
+
+    def test_install_task_ps1_defaults_to_interactive_and_update_all_bat_exists(self):
+        ps1 = (REPO_ROOT / "install_task.ps1").read_text(encoding="ascii")
+        self.assertIn("-LogonType $logonType", ps1)
+        self.assertIn("Interactive", ps1)
+        self.assertIn("$BackgroundS4U", ps1)
+        self.assertIn("$StopRunning", ps1)
+        self.assertTrue((REPO_ROOT / "update_all.bat").is_file())
+
+    def test_read_wheel_requires_and_preflight_probe_with_real_python(self):
+        whl = self.root / "whimbox-3.1.5-py3-none-any.whl"
+        with zipfile.ZipFile(whl, "w") as zf:
+            zf.writestr("whimbox/__init__.py", "")
+            zf.writestr(
+                "whimbox-3.1.5.dist-info/METADATA",
+                "Metadata-Version: 2.1\n"
+                "Name: whimbox\n"
+                "Version: 3.1.5\n"
+                "Requires-Dist: definitely-not-installed-pkg-xyz==9.9.9\n"
+                "Requires-Dist: some-extra==1.0; extra == 'dev'\n",
+            )
+        reqs = updater.read_wheel_requires(str(whl))
+        self.assertEqual(reqs, ["definitely-not-installed-pkg-xyz==9.9.9"])
+        with mock.patch.object(updater, "PY_EXE", sys.executable), \
+                mock.patch.object(updater, "env_for_pip", return_value=os.environ.copy()):
+            issues = updater.check_wheel_dependencies(str(whl))
+        self.assertIsNotNone(issues)
+        self.assertEqual(len(issues), 1)
+        self.assertIn("definitely-not-installed-pkg-xyz==9.9.9", issues[0])
 
 
 if __name__ == "__main__":

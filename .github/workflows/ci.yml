@@ -33,3 +33,18 @@ jobs:
       - name: Verify batch CRLF line endings and ASCII install_task.ps1
         run: |
           python -c "import glob, sys; bad = [p for p in glob.glob('*.bat') if b'\n' in open(p, 'rb').read().replace(b'\r\n', b'')]; assert not bad, f'Non-CRLF bat files: {bad}'; open('install_task.ps1', 'rb').read().decode('ascii'); print('Format checks OK')"
+
+      - name: Verify PowerShell script syntax
+        shell: pwsh
+        run: |
+          $files = @('install_task.ps1', 'tools/build_windows.ps1')
+          foreach ($f in $files) {
+            $tokens = $null
+            $errors = $null
+            [System.Management.Automation.Language.Parser]::ParseFile((Resolve-Path $f).Path, [ref]$tokens, [ref]$errors) | Out-Null
+            if ($errors.Count -gt 0) {
+              $msg = ($errors | ForEach-Object { $_.Message }) -join '; '
+              throw "PowerShell syntax error in ${f}: $msg"
+            }
+          }
+          Write-Host 'PowerShell AST syntax checks OK'

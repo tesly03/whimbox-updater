@@ -1,5 +1,30 @@
 # 更新记录
 
+## v1.3.0
+
+### 网络高可用与免配额回退
+
+- 保留官方 GitHub REST API（支持 `ETag` 304 与可选 `GITHUB_TOKEN`）为首选通道，新增**免 API 限流的直连网页回退链**：当 `api.github.com` 触发 403 限流或暂不可用时，自动直连 `releases.atom` 与 `releases/expanded_assets/<tag>` 获取官方附件链接与原生 SHA256 摘要，并正确解码 HTML 实体更新说明。
+- `WhimboxScripts` 最新提交检测新增 Git Smart-HTTP `info/refs?service=git-upload-pack` 通道（仅约 300 字节且不受 GitHub REST API 配额限制），支持直连与代理无缝回退。
+- 移除已失效的 `ghproxy.net`，调整内置代理为 `gh-proxy.org`、`ghfast.top`、`gh-proxy.com`，新增单次运行内代理熔断机制（仅熔断超时/连接错误/5xx，保留对端点 4xx 限制的兼容）以及跨独立运营方的多代理 API + 网页摘要交叉校验。
+- 安装包下载支持 `Range` 断点续传（按 SHA256 隔离 `.part` 临时缓存，支持校验失败自动清除并重下、自动清理 3 天以上旧断点文件）及无进展 60 秒停滞超时检测。
+
+### 奇想盒前后端协同与安装健壮性
+
+- 解决官方前端退出时未终止 `python-embedded\python.exe` 导致后台孤儿进程阻塞更新器的问题：进程守卫可精准区分前端活跃运行与残留后台 `python.exe`，当仅存在残留后端时默认自动安全清理（支持 `--no-kill-orphan-backend` 关闭）；若前端正在运行仍默认拒绝修改，并新增 `--stop-running` 按需自动关闭前后端。
+- 全新安装自动补齐依赖：当目标环境尚未安装 `whimbox`（`backend_version == "unknown"`，仅含官方裸 `Python312.zip`）时自动启用国内 PyPI 镜像补齐运行依赖；升级存量环境时在备份/写入前直接读取 wheel `METADATA` 执行 `Requires-Dist` 预检，缺少依赖立即提示且不触碰当前环境。
+- `pip check` 升级为基线差异比对：仅阻断涉及 `whimbox` 的依赖问题或本次安装新引入的冲突，不再因环境中原本存在的无关第三方包提示永久卡死更新；同时在 `backup.json` 中记录环境包版本快照。
+- `backend_version()` 新增单 `.dist-info` 纯文件快速探测路径，减少 Windows 下重复拉起 `python.exe` 的冷启动开销。
+
+### 路线同步、交互入口与构建安全
+
+- 订阅匹配同时支持仓库文件名、省略 `.json` 名称以及奇想盒界面内显示名称（`info.name`，如 `祈愿树林 星荧草`），新增 `--list-scripts` 列出全部远端路线及显示名。
+- 8 条以内的文件名订阅在已知 commit SHA 时直接通过 `raw.githubusercontent.com` 按需精准拉取，跳过整仓 `main.zip` 下载；全量同步时可安全归档上游已移除且未被用户修改过的旧路线文件，保护用户自定义与修改过的路线。
+- 修复 `update_now.bat --quiet` 或 `--help`/`--version` 被 `--pause` 阻塞的问题；禁用 `argparse` 参数缩写防止绕过提权前配置编辑剥离；运行前端 NSIS 安装器时隔离 PyInstaller 环境变量并将工作目录切换至下载目录避免占用 `APP_DIR`。
+- 新增 `update_all.bat` 一键联合更新前后端与路线，新增 `--check-self` 检查更新器自身版本。
+- `install_task.ps1` 默认改用 `-LogonType Interactive -RunLevel Highest`（兼容微软账户/PIN 登录并复用当前用户本地代理，保留 `-BackgroundS4U` 与 `-StopRunning` 可选开关）。
+- 便携版 ZIP 顶层包裹 `whimbox-updater/` 目录防止解压散落；PyInstaller 打包嵌入 Windows 版本资源信息并裁剪无关标准库模块；CI 增加 PowerShell AST 语法检查，Release 工作流增加 `actions/attest-build-provenance` 构建溯源证明。
+
 ## v1.2.0
 
 ### 前后端分离适配与运行安全

@@ -7,6 +7,8 @@ param(
     [string]$Time = '09:00',
     [string]$TaskUser = '',
     [string]$UserLocalAppData = '',
+    [switch]$BackgroundS4U,
+    [switch]$StopRunning,
     [switch]$PauseOnExit
 )
 $ErrorActionPreference = 'Stop'
@@ -55,19 +57,23 @@ try {
     New-Item -ItemType Directory -Path $DataDir -Force | Out-Null
 
     $arguments = @($prefix) + @('--app-dir', $AppDir, '--data-dir', $DataDir, '--quiet', '--no-elevate')
+    if ($StopRunning) {
+        $arguments += '--stop-running'
+    }
     $argumentLine = ($arguments | ForEach-Object {
         $escaped = $_ -replace '(\\*)"', '$1$1\"' -replace '(\\+)$', '$1$1'
         '"{0}"' -f $escaped
     }) -join ' '
 
     $resolvedUser = if ($TaskUser) { $TaskUser } else { "$env:USERDOMAIN\$env:USERNAME" }
+    $logonType = if ($BackgroundS4U) { 'S4U' } else { 'Interactive' }
     $taskName = 'WhimboxAutoUpdate'
     $trigger = New-ScheduledTaskTrigger -Daily -At $Time
     $action = New-ScheduledTaskAction -Execute $executable -Argument $argumentLine -WorkingDirectory $PSScriptRoot
-    $principal = New-ScheduledTaskPrincipal -UserId $resolvedUser -LogonType S4U -RunLevel Highest
+    $principal = New-ScheduledTaskPrincipal -UserId $resolvedUser -LogonType $logonType -RunLevel Highest
     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -StartWhenAvailable -MultipleInstances IgnoreNew -ExecutionTimeLimit (New-TimeSpan -Hours 1)
     Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
-    Write-Host "OK: '$taskName' registered for daily $Time as $resolvedUser with highest privileges."
+    Write-Host "OK: '$taskName' registered for daily $Time as $resolvedUser ($logonType, highest privileges)."
     Write-Host "App directory: $AppDir"
     Write-Host "Data and logs: $DataDir"
     Write-Host "Remove: Unregister-ScheduledTask -TaskName '$taskName' -Confirm:`$false"
