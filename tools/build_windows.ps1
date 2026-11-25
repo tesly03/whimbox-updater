@@ -19,10 +19,9 @@ $requiredFiles = @(
     (Join-Path $repo '.github/workflows/windows-release.yml')
 )
 $entryNames = @(
-    'run_updater.bat', 'update_now.bat', 'check_only.bat', 'rollback.bat',
+    'run_updater.bat', 'update_now.bat', 'update_frontend.bat', 'check_only.bat', 'rollback.bat',
     'subscriptions.bat', 'install_task.bat', 'install_task.ps1'
 )
-$pyInstallerVersion = '6.16.0'
 
 foreach ($path in $requiredFiles) {
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
@@ -34,6 +33,13 @@ foreach ($name in $entryNames) {
         throw "Required entry point is missing: $name"
     }
 }
+
+$reqText = [System.IO.File]::ReadAllText((Join-Path $repo 'requirements-build.txt'))
+$pyInstallerMatch = [regex]::Match($reqText, '(?m)^PyInstaller==(?<version>[0-9A-Za-z._-]+)\s*$')
+if (-not $pyInstallerMatch.Success) {
+    throw 'Could not read pinned PyInstaller==VERSION from requirements-build.txt'
+}
+$pyInstallerVersion = $pyInstallerMatch.Groups['version'].Value
 
 $sourceText = [System.IO.File]::ReadAllText($source)
 $versionMatch = [regex]::Match($sourceText, '(?m)^VERSION\s*=\s*["''](?<version>[^"'']+)["'']\s*$')

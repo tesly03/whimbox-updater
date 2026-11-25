@@ -10,6 +10,9 @@ __pycache__/
 *.whl
 *.zip
 
+# 构建产物目录
+release-assets/
+
 # 系统文件
 Thumbs.db
 .DS_Store

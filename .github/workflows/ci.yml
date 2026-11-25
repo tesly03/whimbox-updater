@@ -1,0 +1,35 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Verify batch CRLF line endings and ASCII install_task.ps1
+        run: |
+          python -c "import glob, sys; bad = [p for p in glob.glob('*.bat') if b'\n' in open(p, 'rb').read().replace(b'\r\n', b'')]; assert not bad, f'Non-CRLF bat files: {bad}'; open('install_task.ps1', 'rb').read().decode('ascii'); print('Format checks OK')"

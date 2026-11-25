@@ -7,14 +7,12 @@ Only the build process needs PyInstaller; the updater uses the standard library.
 from __future__ import annotations
 
 import argparse
-from contextlib import contextmanager
 import ctypes
-from datetime import datetime
+from datetime import datetime, timedelta
 import glob
 import hashlib
 import json
 import os
-from pathlib import Path
 import re
 import shutil
 import struct
@@ -27,13 +25,14 @@ import urllib.request
 import uuid
 import zipfile
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 DEFAULT_APP_DIR = r"C:\Program Files\whimbox_app"
 RELEASES_API = "https://api.github.com/repos/nikkigallery/Whimbox/releases?per_page=30"
 SCRIPTS_ARCHIVE_URL = "https://github.com/nikkigallery/WhimboxScripts/archive/refs/heads/main.zip"
 SCRIPTS_COMMIT_API = "https://api.github.com/repos/nikkigallery/WhimboxScripts/commits/main"
 PROXIES = ["https://gh-proxy.com/", "https://ghfast.top/", "https://ghproxy.net/", ""]
 PIP_MIRRORS = [
+    "https://mirrors.ustc.edu.cn/pypi/simple/",
     "https://pypi.tuna.tsinghua.edu.cn/simple/",
     "https://mirrors.cloud.tencent.com/pypi/simple/",
     "https://mirrors.aliyun.com/pypi/simple/",
@@ -43,8 +42,13 @@ CHUNK = 256 * 1024
 MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
 MAX_SCRIPT_BYTES = 32 * 1024 * 1024
 BACKUP_KEEP = 3
+SCRIPT_BACKUP_KEEP = 10
+DOWNLOAD_KEEP = 3
+LOG_KEEP_DAYS = 14
 QUIET = False
 _LOG_PATH = None
+_DIRECT_ONLY = False
+_CUSTOM_PROXIES = None
 
 
 def runtime_dir():
@@ -67,10 +71,11 @@ def _detect_app_dir():
 
 
 def configure_paths(app_dir=None, data_dir=None):
-    global APP_DIR, PY_EXE, SITE_PACKAGES, ASAR, SCRIPTS_DIR, DOWNLOAD_DIR
+    global APP_DIR, APP_EXE, PY_EXE, SITE_PACKAGES, ASAR, SCRIPTS_DIR, DOWNLOAD_DIR
     global LOG_DIR_GLOB, SCRIPT_DIR, DATA_DIR, BACKUP_DIR, LEGACY_BACKUP_DIR
-    global LOG_DIR, WATCHLIST_FILE, STATE_FILE, RELEASE_CACHE, SCRIPTS_STATE, _LOG_PATH
+    global LOG_DIR, WATCHLIST_FILE, STATE_FILE, RELEASE_CACHE, RELEASE_META, SCRIPTS_STATE, _LOG_PATH
     APP_DIR = os.path.abspath(app_dir or _detect_app_dir())
+    APP_EXE = os.path.join(APP_DIR, "whimbox_app.exe")
     SCRIPT_DIR = runtime_dir()
     PY_EXE = os.path.join(APP_DIR, "python-embedded", "python.exe")
     SITE_PACKAGES = os.path.join(APP_DIR, "python-embedded", "Lib", "site-packages")
@@ -87,6 +92,7 @@ def configure_paths(app_dir=None, data_dir=None):
     WATCHLIST_FILE = os.path.join(DATA_DIR, "watchlist.json")
     STATE_FILE = os.path.join(DATA_DIR, "state.json")
     RELEASE_CACHE = os.path.join(DATA_DIR, "releases_cache.json")
+    RELEASE_META = os.path.join(DATA_DIR, "releases_meta.json")
     SCRIPTS_STATE = os.path.join(DATA_DIR, "scripts_state.json")
     _LOG_PATH = None
 
@@ -119,6 +125,23 @@ def log(msg, level="INFO"):
         pass  # Logging must not prevent permission checks or error reporting.
 
 
+def _is_transient_lock_error(exc):
+    if isinstance(exc, PermissionError):
+        return True
+    winerror = getattr(exc, "winerror", None)
+    return winerror in (5, 32, 33)  # Access denied / sharing violation / lock violation
+
+
+def _retry_fs(func, *args, retries=3, base_delay=0.1, **kwargs):
+    for attempt in range(retries + 1):
+        try:
+            return func(*args, **kwargs)
+        except OSError as exc:
+            if attempt >= retries or not _is_transient_lock_error(exc):
+                raise
+            time.sleep(base_delay * (attempt + 1))
+
+
 def atomic_write_bytes(path, data):
     parent = os.path.dirname(os.path.abspath(path))
     os.makedirs(parent, exist_ok=True)
@@ -128,7 +151,7 @@ def atomic_write_bytes(path, data):
             output.write(data)
             output.flush()
             os.fsync(output.fileno())
-        os.replace(temporary, path)
+        _retry_fs(os.replace, temporary, path)
     finally:
         if os.path.exists(temporary):
             os.remove(temporary)
@@ -141,6 +164,42 @@ def atomic_write_json(path, data):
 def _read_json(path):
     with open(path, "r", encoding="utf-8-sig") as source:
         return json.load(source)
+
+
+def _normalize_proxy_url(raw):
+    value = (raw or "").strip()
+    if not value or value.lower() in ("direct", "none"):
+        return ""
+    if not value.startswith("https://"):
+        raise ValueError("代理地址必须以 https:// 开头：%s" % value)
+    return value if value.endswith("/") else value + "/"
+
+
+def get_proxies():
+    if _DIRECT_ONLY:
+        return [""]
+    if _CUSTOM_PROXIES is not None:
+        return list(_CUSTOM_PROXIES)
+    env_value = os.environ.get("WHIMBOX_PROXIES")
+    if env_value is not None:
+        stripped = env_value.strip()
+        if stripped.lower() in ("direct", "none"):
+            return [""]
+        if stripped:
+            items = [_normalize_proxy_url(part) for part in stripped.split(",")]
+            result = list(dict.fromkeys(items))
+            if "" not in result:
+                result.append("")
+            return result
+    return list(PROXIES)
+
+
+def _github_token():
+    return (os.environ.get("GITHUB_TOKEN") or os.environ.get("GH_TOKEN") or "").strip()
+
+
+def _is_official_github_api(url):
+    return isinstance(url, str) and url.startswith("https://api.github.com/")
 
 
 class UpdateLock:
@@ -186,19 +245,33 @@ class UpdateLock:
 
 
 def env_for_pip():
+    """Build an isolated environment matching Whimbox's embedded Python setup."""
     environment = os.environ.copy()
+    for var in ("PYTHONPATH", "_MEIPASS", "_MEIPASS2", "TCL_LIBRARY", "TK_LIBRARY"):
+        environment.pop(var, None)
+    python_dir = os.path.dirname(os.path.abspath(PY_EXE))
+    scripts_dir = os.path.join(python_dir, "Scripts")
+    existing_path = environment.get("PATH", "")
+    path_parts = [python_dir, scripts_dir]
+    if existing_path:
+        path_parts.append(existing_path)
+    environment["PATH"] = os.pathsep.join(path_parts)
+    environment["PYTHONHOME"] = python_dir
     environment["PYTHONIOENCODING"] = "utf-8"
+    environment["PYTHONUNBUFFERED"] = "1"
     environment["PIP_DISABLE_PIP_VERSION_CHECK"] = "1"
     environment["PYTHONNOUSERSITE"] = "1"
     return environment
 
 
-def run_cmd(args, timeout=300):
+def run_cmd(args, timeout=300, cwd=None):
     log("$ " + subprocess.list2cmdline([str(arg) for arg in args]))
     try:
-        process = subprocess.run(args, capture_output=True, text=True, encoding="utf-8", errors="replace",
-                                 timeout=timeout, env=env_for_pip())
-        output = ((process.stdout or "") + (process.stderr or "")).strip()
+        process = subprocess.run(
+            args, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=timeout, env=env_for_pip(), cwd=cwd,
+        )
+        output = ((process.stdout or "") + "\n" + (process.stderr or "")).strip()
         for line in output.splitlines()[-40:]:
             log("  | " + line, "CMD")
         return process.returncode == 0, output
@@ -208,22 +281,168 @@ def run_cmd(args, timeout=300):
         return False, str(exc)
 
 
+def _dir_is_writable(path):
+    target = os.path.abspath(path)
+    while not os.path.isdir(target):
+        parent = os.path.dirname(target)
+        if parent == target:
+            return False
+        target = parent
+    try:
+        fd, probe = tempfile.mkstemp(prefix=".updater-perm-", suffix=".tmp", dir=target)
+        os.close(fd)
+        os.remove(probe)
+        return True
+    except OSError:
+        return False
+
+
+def _path_is_within(path, root):
+    try:
+        norm_path = os.path.normcase(os.path.abspath(path))
+        norm_root = os.path.normcase(os.path.abspath(root))
+        return os.path.commonpath([norm_path, norm_root]) == norm_root
+    except ValueError:
+        return False
+
+
+def find_running_whimbox_processes(app_dir=None):
+    """Detect running Whimbox frontend/backend processes under APP_DIR on Windows."""
+    if os.name != "nt":
+        return []
+    target_app_dir = os.path.abspath(app_dir or APP_DIR)
+    updater_dir = os.path.abspath(SCRIPT_DIR)
+    updater_subdir = (_path_is_within(updater_dir, target_app_dir)
+                      and os.path.normcase(updater_dir) != os.path.normcase(target_app_dir))
+    whimbox_exe_names = {"whimbox_app.exe", "whimbox_launcher.exe"}
+    from ctypes import wintypes
+
+    class ProcessEntry32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_void_p),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", ctypes.c_long),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    kernel.CreateToolhelp32Snapshot.argtypes = [wintypes.DWORD, wintypes.DWORD]
+    kernel.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    kernel.Process32FirstW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W)]
+    kernel.Process32FirstW.restype = wintypes.BOOL
+    kernel.Process32NextW.argtypes = [wintypes.HANDLE, ctypes.POINTER(ProcessEntry32W)]
+    kernel.Process32NextW.restype = wintypes.BOOL
+    kernel.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+    kernel.OpenProcess.restype = wintypes.HANDLE
+    kernel.QueryFullProcessImageNameW.argtypes = [
+        wintypes.HANDLE, wintypes.DWORD, wintypes.LPWSTR, ctypes.POINTER(wintypes.DWORD)
+    ]
+    kernel.QueryFullProcessImageNameW.restype = wintypes.BOOL
+    kernel.CloseHandle.argtypes = [wintypes.HANDLE]
+
+    invalid_handle = ctypes.c_void_p(-1).value
+    snapshot = kernel.CreateToolhelp32Snapshot(0x00000002, 0)  # TH32CS_SNAPPROCESS
+    if snapshot == invalid_handle or not snapshot:
+        return []
+    entries = {}
+    try:
+        entry = ProcessEntry32W()
+        entry.dwSize = ctypes.sizeof(entry)
+        if kernel.Process32FirstW(snapshot, ctypes.byref(entry)):
+            while True:
+                entries[int(entry.th32ProcessID)] = (int(entry.th32ParentProcessID), entry.szExeFile)
+                if not kernel.Process32NextW(snapshot, ctypes.byref(entry)):
+                    break
+    finally:
+        kernel.CloseHandle(snapshot)
+
+    # Exclude our own process and ancestor chain (important in source mode using embedded python).
+    excluded = set()
+    cur_pid = os.getpid()
+    for _ in range(16):
+        if cur_pid <= 0 or cur_pid in excluded:
+            break
+        excluded.add(cur_pid)
+        cur_pid = entries.get(cur_pid, (0, ""))[0]
+
+    running = []
+    for pid, (_, exe_name) in entries.items():
+        if pid in excluded or pid == 0:
+            continue
+        handle = kernel.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+        image_path = None
+        if handle:
+            try:
+                buf_len = wintypes.DWORD(1024)
+                buf = ctypes.create_unicode_buffer(buf_len.value)
+                if kernel.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(buf_len)):
+                    image_path = buf.value
+            finally:
+                kernel.CloseHandle(handle)
+        if image_path:
+            if updater_subdir and _path_is_within(image_path, updater_dir):
+                continue
+            if _path_is_within(image_path, target_app_dir):
+                running.append((pid, exe_name, image_path))
+        elif exe_name.lower() in whimbox_exe_names:
+            running.append((pid, exe_name, None))
+    return running
+
+
+def _ensure_whimbox_not_running():
+    running = find_running_whimbox_processes(APP_DIR)
+    if running:
+        summary = "、".join("%s (PID %d)" % (name, pid) for pid, name, _ in running[:5])
+        raise RuntimeError("检测到奇想盒正在运行（%s），请先完全退出奇想盒后再更新或回滚。" % summary)
+
+
 class _ElevatedExit(SystemExit):
     """The elevated child owns interactive output and its final pause."""
 
 
-def ensure_admin():
+def _child_args_after_config_edit(raw_args):
+    """Strip --edit-subscriptions / --watch so an elevated child never opens Notepad again."""
+    result = []
+    index = 0
+    saw_edit_or_watch = False
+    while index < len(raw_args):
+        token = raw_args[index]
+        if token == "--edit-subscriptions":
+            saw_edit_or_watch = True
+            index += 1
+        elif token == "--watch":
+            saw_edit_or_watch = True
+            index += 2
+        elif token.startswith("--watch="):
+            saw_edit_or_watch = True
+            index += 1
+        else:
+            result.append(token)
+            index += 1
+    if saw_edit_or_watch and "--scripts-only" not in result:
+        result.append("--scripts-only")
+    return result
+
+
+def ensure_admin(strip_config_edit=False):
     if os.name != "nt":
         return
     if ctypes.windll.shell32.IsUserAnAdmin():
         return
     log("正在以管理员身份重新启动更新器。")
+    base_args = _child_args_after_config_edit(sys.argv[1:]) if strip_config_edit else list(sys.argv[1:])
     if getattr(sys, "frozen", False):
-        arguments = sys.argv[1:]
+        arguments = base_args
         if len(sys.argv) == 1 and not QUIET:
             arguments.append("--pause")
     else:
-        arguments = [os.path.abspath(__file__), *sys.argv[1:]]
+        arguments = [os.path.abspath(__file__), *base_args]
     arguments += ["--no-elevate", "--app-dir", APP_DIR, "--data-dir", DATA_DIR]
     # ShellExecuteEx permits waiting and preserving the elevated child's exit code.
     from ctypes import wintypes
@@ -291,13 +510,16 @@ def backend_version():
 def frontend_version():
     try:
         with open(ASAR, "rb") as source:
-            header = source.read(8)
-            length = struct.unpack("<I", header[4:8])[0]
+            header = source.read(16)
+            if len(header) != 16:
+                raise ValueError("ASAR header too short")
+            _, length, _, json_size = struct.unpack("<4I", header)
             if not 8 <= length <= 32 * 1024 * 1024:
                 raise ValueError("ASAR header length")
+            if not 0 < json_size <= length - 8:
+                raise ValueError("ASAR JSON length")
             base = 8 + length
-            source.seek(16)
-            data, _ = json.JSONDecoder().raw_decode(source.read(length - 8).decode("utf-8"))
+            data = json.loads(source.read(json_size).decode("utf-8"))
             package = data["files"]["package.json"]
             size = int(package["size"])
             if not 0 < size < 1024 * 1024:
@@ -317,8 +539,12 @@ def frontend_version():
     return "unknown"
 
 
-def http_get(url, timeout=20, headers=None, stream=False):
+def http_get(url, timeout=20, headers=None):
     request_headers = {"User-Agent": UA, "Accept": "application/vnd.github+json"}
+    if _is_official_github_api(url):
+        token = _github_token()
+        if token:
+            request_headers["Authorization"] = "Bearer " + token
     request_headers.update(headers or {})
     return urllib.request.urlopen(urllib.request.Request(url, headers=request_headers), timeout=timeout)
 
@@ -331,6 +557,22 @@ def http_json(url, timeout=20, headers=None):
         return json.loads(raw.decode("utf-8"))
 
 
+def _http_json_conditional(url, etag=None, timeout=20, headers=None):
+    req_headers = dict(headers or {})
+    if etag:
+        req_headers["If-None-Match"] = etag
+    try:
+        with http_get(url, timeout=timeout, headers=req_headers) as response:
+            raw = response.read(4 * 1024 * 1024 + 1)
+            if len(raw) > 4 * 1024 * 1024:
+                raise ValueError("远端 JSON 超过大小限制")
+            return json.loads(raw.decode("utf-8")), response.headers.get("ETag"), False
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304:
+            return None, etag, True
+        raise
+
+
 def sha256_file(path):
     digest = hashlib.sha256()
     with open(path, "rb") as source:
@@ -339,35 +581,129 @@ def sha256_file(path):
     return digest.hexdigest()
 
 
-def cache_releases(releases):
+def _normalize_releases(data):
+    if not isinstance(data, list):
+        raise ValueError("Release 响应类型异常")
+    valid = [release for release in data if isinstance(release, dict)
+             and not release.get("draft") and not release.get("prerelease")]
+    valid.sort(key=lambda release: release.get("published_at") or "", reverse=True)
+    return valid
+
+
+def cache_releases(releases, etag=None, source="direct"):
     slim = [{key: release.get(key) for key in ("tag_name", "name", "published_at", "body", "draft", "prerelease", "assets")}
             for release in releases[:30]]
     atomic_write_json(RELEASE_CACHE, slim)
+    atomic_write_json(RELEASE_META, {
+        "etag": etag,
+        "source": source,
+        "fetched_at": datetime.now().isoformat(timespec="seconds"),
+    })
+
+
+def _load_cached_releases():
+    try:
+        cached = _read_json(RELEASE_CACHE)
+        if isinstance(cached, list) and cached:
+            return cached
+    except (OSError, ValueError):
+        pass
+    return None
+
+
+def _load_release_meta():
+    try:
+        meta = _read_json(RELEASE_META)
+        if isinstance(meta, dict):
+            return meta
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def _asset_digest_map(releases):
+    mapping = {}
+    for release in releases[:15]:
+        tag = release.get("tag_name") or ""
+        for asset in release.get("assets", []):
+            name = asset.get("name") or ""
+            digest = asset_digest(asset)
+            if name and digest:
+                mapping[(tag, name)] = digest
+    return mapping
+
+
+def _select_verified_proxy_releases(first_releases, second_releases):
+    first_map = _asset_digest_map(first_releases)
+    second_map = _asset_digest_map(second_releases)
+    common = set(first_map) & set(second_map)
+    for key in common:
+        if first_map[key] != second_map[key]:
+            raise RuntimeError(
+                "不同代理通道返回的 %s (%s) SHA256 摘要不一致，已中止以防篡改。" % (key[1], key[0])
+            )
+    if not common:
+        raise RuntimeError("不同代理通道返回的 Release 列表无共同可验证条目，已中止。")
+    corroborated = []
+    for release in first_releases:
+        tag = release.get("tag_name") or ""
+        assets = release.get("assets", [])
+        if any((tag, asset.get("name") or "") in common for asset in assets):
+            corroborated.append(release)
+    return corroborated or first_releases
 
 
 def fetch_releases():
     last_error = None
-    for url in [RELEASES_API] + [prefix + RELEASES_API for prefix in PROXIES if prefix]:
+    cached = _load_cached_releases()
+    meta = _load_release_meta()
+    cached_etag = meta.get("etag") if cached and meta.get("source") == "direct" else None
+
+    # 1. Always prefer official GitHub API directly so SHA256 digests come from GitHub itself.
+    try:
+        data, new_etag, not_modified = _http_json_conditional(RELEASES_API, etag=cached_etag)
+        if not_modified and cached:
+            log("Release 信息未变更（304 缓存命中）。")
+            return cached
+        valid = _normalize_releases(data)
+        if valid:
+            cache_releases(valid, etag=new_etag, source="direct")
+            return valid
+    except (OSError, ValueError) as exc:
+        last_error = exc
+
+    # 2. Fallback to proxy channels with cross-proxy SHA256 digest consensus when >=2 proxies respond.
+    proxy_prefixes = [prefix for prefix in get_proxies() if prefix]
+    proxy_results = []
+    for prefix in proxy_prefixes:
         try:
-            data = http_json(url)
-            if not isinstance(data, list):
-                raise ValueError("Release 响应类型异常")
-            valid = [release for release in data if isinstance(release, dict)
-                     and not release.get("draft") and not release.get("prerelease")]
-            valid.sort(key=lambda release: release.get("published_at") or "", reverse=True)
+            data = http_json(prefix + RELEASES_API)
+            valid = _normalize_releases(data)
             if valid:
-                cache_releases(valid)
-                return valid
+                proxy_results.append((prefix, valid))
+                if len(proxy_results) >= 2:
+                    break
         except (OSError, ValueError) as exc:
             last_error = exc
+
+    if proxy_results:
+        first_prefix, first_releases = proxy_results[0]
+        if len(proxy_results) >= 2:
+            second_prefix, second_releases = proxy_results[1]
+            chosen = _select_verified_proxy_releases(first_releases, second_releases)
+            log("直连 GitHub API 失败，已通过两个代理通道交叉验证 Release 摘要（%s、%s）。"
+                % (first_prefix, second_prefix), "WARN")
+        else:
+            chosen = first_releases
+            log("直连 GitHub API 失败，仅通过单个代理通道获取 Release 摘要（%s）；建议直连或设置 GITHUB_TOKEN。"
+                % first_prefix, "WARN")
+        cache_releases(chosen, etag=None, source="proxy")
+        return chosen
+
     log("版本查询通道暂不可用，尝试本地缓存：%s" % last_error, "WARN")
-    try:
-        cached = _read_json(RELEASE_CACHE)
-        if isinstance(cached, list) and cached:
-            log("正在使用缓存版本信息，可能不是最新发布。", "WARN")
-            return cached
-    except (OSError, ValueError):
-        pass
+    if cached:
+        log("正在使用缓存版本信息，可能不是最新发布。", "WARN")
+        return cached
     raise RuntimeError("版本查询失败且没有有效缓存")
 
 
@@ -400,6 +736,14 @@ def _safe_filename(name):
             and name == name.strip() and not name.endswith("."))
 
 
+def _summarize_release_notes(body, max_lines=5):
+    if not body:
+        return []
+    cleaned = re.sub(r"<[^>]+>", "", body)
+    lines = [line.strip() for line in cleaned.splitlines() if line.strip()]
+    return lines[:max_lines]
+
+
 def verify_wheel(path):
     with zipfile.ZipFile(path) as archive:
         if sum(item.file_size for item in archive.infolist()) > 512 * 1024 * 1024:
@@ -416,6 +760,14 @@ def verify_wheel(path):
         return version.group(1)
 
 
+def _format_size(num_bytes):
+    if num_bytes >= 1024 * 1024:
+        return "%.1f MB" % (num_bytes / (1024 * 1024))
+    if num_bytes >= 1024:
+        return "%.1f KB" % (num_bytes / 1024)
+    return "%d B" % num_bytes
+
+
 def download_asset(url, dest, expected_size=None, expected_sha=None, is_whl=False):
     if not expected_sha or not re.fullmatch(r"[0-9a-fA-F]{64}", expected_sha):
         raise RuntimeError("安装包缺少有效 SHA256，已保留当前安装；请检查上游 Release。")
@@ -424,10 +776,11 @@ def download_asset(url, dest, expected_size=None, expected_sha=None, is_whl=Fals
     os.makedirs(os.path.dirname(os.path.abspath(dest)), exist_ok=True)
     expected_sha = expected_sha.lower()
 
-    def verify(path):
+    def verify(path, computed_sha=None):
         if expected_size and os.path.getsize(path) != expected_size:
             raise ValueError("安装包文件大小不符")
-        if sha256_file(path) != expected_sha:
+        actual_sha = computed_sha if computed_sha is not None else sha256_file(path)
+        if actual_sha != expected_sha:
             raise ValueError("安装包 SHA256 校验失败")
         return verify_wheel(path) if is_whl else None
 
@@ -438,16 +791,20 @@ def download_asset(url, dest, expected_size=None, expected_sha=None, is_whl=Fals
             return version
         except (OSError, ValueError, zipfile.BadZipFile):
             pass
-    for prefix in PROXIES:
+
+    budget = 420 if (expected_size or 0) > 64 * 1024 * 1024 else 240
+    for prefix in get_proxies():
         fd, temporary = tempfile.mkstemp(prefix=".download-", suffix=".part", dir=os.path.dirname(os.path.abspath(dest)))
         os.close(fd)
         channel = prefix or "GitHub 直连"
         try:
             log("下载通道：%s" % channel)
             request = urllib.request.Request(prefix + url, headers={"User-Agent": UA})
-            with urllib.request.urlopen(request, timeout=25 if prefix else 12) as response, open(temporary, "wb") as output:
+            stream_hash = hashlib.sha256()
+            with urllib.request.urlopen(request, timeout=25 if prefix else 15) as response, open(temporary, "wb") as output:
                 total = 0
-                deadline = time.monotonic() + 240
+                deadline = time.monotonic() + budget
+                last_report = time.monotonic()
                 while True:
                     if time.monotonic() > deadline:
                         raise TimeoutError("下载超过单通道时间预算")
@@ -457,10 +814,19 @@ def download_asset(url, dest, expected_size=None, expected_sha=None, is_whl=Fals
                     total += len(chunk)
                     if total > (expected_size or 512 * 1024 * 1024):
                         raise ValueError("下载内容超过预期大小")
+                    stream_hash.update(chunk)
                     output.write(chunk)
-            version = verify(temporary)
-            os.replace(temporary, dest)
-            log("下载与 SHA256 校验完成：%s" % os.path.basename(dest))
+                    now = time.monotonic()
+                    if not QUIET and now - last_report >= 3.0:
+                        if expected_size:
+                            pct = min(100, int(total * 100 / expected_size))
+                            print("  下载进度：%d%% (%s / %s)" % (pct, _format_size(total), _format_size(expected_size)), flush=True)
+                        else:
+                            print("  已下载：%s" % _format_size(total), flush=True)
+                        last_report = now
+            version = verify(temporary, computed_sha=stream_hash.hexdigest())
+            _retry_fs(os.replace, temporary, dest)
+            log("下载与 SHA256 校验完成：%s（%s）" % (os.path.basename(dest), _format_size(os.path.getsize(dest))))
             return version
         except (OSError, ValueError, zipfile.BadZipFile) as exc:
             log("下载通道失败：%s" % str(exc)[:200], "WARN")
@@ -506,7 +872,7 @@ def backup_backend(ver):
             "had_backend": existed, "files": _snapshot_hashes(temporary),
             "app_dir": APP_DIR, "dependency_policy": "unchanged --no-deps",
         })
-        os.replace(temporary, final)
+        _retry_fs(os.replace, temporary, final)
         log("已完成并校验后端备份：%s" % final)
         return final
     finally:
@@ -522,12 +888,27 @@ def _backup_candidates():
     return output
 
 
+def _backup_sort_key(path):
+    created = ""
+    try:
+        meta = _read_json(os.path.join(path, "backup.json"))
+        if isinstance(meta, dict) and isinstance(meta.get("created"), str):
+            created = meta["created"]
+    except (OSError, ValueError):
+        pass
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        mtime = 0.0
+    return (created, mtime)
+
+
 def latest_backup():
     candidates = _backup_candidates()
-    return max(candidates, key=os.path.getmtime) if candidates else None
+    return max(candidates, key=_backup_sort_key) if candidates else None
 
 
-def rollback_backend(new_ver, backup_dir=None):
+def rollback_backend(new_ver=None, backup_dir=None):
     directory = backup_dir or latest_backup()
     if directory is None:
         log("没有可用后端备份。", "ERROR")
@@ -556,11 +937,11 @@ def rollback_backend(new_ver, backup_dir=None):
         for index, path in enumerate(current):
             if os.path.exists(path):
                 saved = os.path.join(stage, "previous-%d" % index)
-                os.replace(path, saved)
+                _retry_fs(os.replace, path, saved)
                 moved.append((path, saved))
         for name in names:
             destination = os.path.join(SITE_PACKAGES, name)
-            os.replace(os.path.join(stage, name), destination)
+            _retry_fs(os.replace, os.path.join(stage, name), destination)
             installed.append(destination)
         got = backend_version()
         if (had_backend and vtuple(got) != vtuple(old)) or (not had_backend and got != "unknown"):
@@ -573,14 +954,14 @@ def rollback_backend(new_ver, backup_dir=None):
         for path in installed:
             try:
                 if os.path.isdir(path):
-                    shutil.rmtree(path)
+                    _retry_fs(shutil.rmtree, path)
             except OSError as recovery_error:
                 recovery_errors.append(str(recovery_error))
                 log("清理未完成的恢复目录失败：%s：%s" % (path, recovery_error), "ERROR")
         for path, saved in reversed(moved):
             try:
                 if os.path.exists(saved):
-                    os.replace(saved, path)
+                    _retry_fs(os.replace, saved, path)
             except OSError as recovery_error:
                 recovery_errors.append(str(recovery_error))
                 log("撤回恢复操作失败，暂存 %s -> %s：%s" % (saved, path, recovery_error), "ERROR")
@@ -603,7 +984,7 @@ def rollback_backend(new_ver, backup_dir=None):
 
 def _prune_backups(protected=None):
     candidates = [path for path in _backup_candidates() if os.path.dirname(path) == BACKUP_DIR]
-    candidates.sort(key=os.path.getmtime, reverse=True)
+    candidates.sort(key=_backup_sort_key, reverse=True)
     for path in candidates[BACKUP_KEEP:]:
         if path != protected:
             try:
@@ -612,32 +993,131 @@ def _prune_backups(protected=None):
                 log("旧备份清理失败：%s" % exc, "WARN")
 
 
-def install_whl(path, force=False):
-    # Install only the application package. A rollback must leave dependencies intact.
-    command = [PY_EXE, "-s", "-m", "pip", "install", "--no-index", "--no-deps",
-               "--disable-pip-version-check"]
-    if force:
-        command.append("--force-reinstall")
-    ok, _ = run_cmd(command + [path], timeout=300)
+def _prune_script_backups():
+    candidates = [path for path in glob.glob(os.path.join(BACKUP_DIR, "scripts-*")) if os.path.isdir(path)]
+    candidates.sort(key=lambda path: (os.path.basename(path), os.path.getmtime(path)), reverse=True)
+    for path in candidates[SCRIPT_BACKUP_KEEP:]:
+        try:
+            shutil.rmtree(path)
+        except OSError as exc:
+            log("旧路线备份清理失败：%s" % exc, "WARN")
+
+
+def _prune_downloads(protected=None):
+    keep_set = {os.path.normcase(os.path.abspath(p)) for p in (protected or ()) if p}
+    for pattern in ("*.whl", "*.exe"):
+        files = [path for path in glob.glob(os.path.join(DOWNLOAD_DIR, pattern)) if os.path.isfile(path)]
+        files.sort(key=os.path.getmtime, reverse=True)
+        for path in files[DOWNLOAD_KEEP:]:
+            if os.path.normcase(os.path.abspath(path)) not in keep_set:
+                try:
+                    os.remove(path)
+                except OSError as exc:
+                    log("旧下载缓存清理失败：%s" % exc, "WARN")
+
+
+def _prune_logs():
+    cutoff = (datetime.now() - timedelta(days=LOG_KEEP_DAYS)).strftime("%Y-%m-%d")
+    current = os.path.normcase(os.path.abspath(_LOG_PATH)) if _LOG_PATH else None
+    for path in glob.glob(os.path.join(LOG_DIR, "updater-*.log")):
+        if current and os.path.normcase(os.path.abspath(path)) == current:
+            continue
+        match = re.fullmatch(r"updater-(\d{4}-\d{2}-\d{2})\.log", os.path.basename(path))
+        if match and match.group(1) < cutoff:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+
+
+def install_whl(path, force=False, sync_deps=False):
+    if sync_deps:
+        log("已启用 --sync-deps：将通过 PyPI 镜像同步第三方依赖（第三方依赖变更不在后端回滚范围内）。", "WARN")
+        installed_ok = False
+        for mirror in [*PIP_MIRRORS, ""]:
+            command = [PY_EXE, "-s", "-m", "pip", "install", "--disable-pip-version-check"]
+            if mirror:
+                command += ["-i", mirror]
+            if force:
+                command.append("--force-reinstall")
+            ok, _ = run_cmd(command + [path], timeout=600)
+            if ok:
+                installed_ok = True
+                break
+            log("pip 源安装失败（%s），尝试下一个源…" % (mirror or "PyPI 默认源"), "WARN")
+        if not installed_ok:
+            return False
+    else:
+        # Install only the application package. A rollback must leave dependencies intact.
+        command = [PY_EXE, "-s", "-m", "pip", "install", "--no-index", "--no-deps",
+                   "--disable-pip-version-check"]
+        if force:
+            command.append("--force-reinstall")
+        ok, _ = run_cmd(command + [path], timeout=300)
+        if not ok:
+            return False
+    ok, check_output = run_cmd([PY_EXE, "-s", "-m", "pip", "check"], timeout=90)
     if not ok:
+        details = "; ".join(line.strip() for line in (check_output or "").splitlines() if line.strip())[:300]
+        if sync_deps:
+            log("依赖检查未通过（%s），将恢复更新前版本。" % (details or "详见命令输出"), "ERROR")
+        else:
+            log("依赖检查未通过（%s），将恢复更新前版本。如需同步更新第三方依赖，请添加 --sync-deps，或在奇想盒设置中手动安装：%s"
+                % (details or "详见命令输出", path), "ERROR")
         return False
-    ok, _ = run_cmd([PY_EXE, "-s", "-m", "pip", "check"], timeout=90)
-    if not ok:
-        log("依赖检查未通过，将恢复更新前版本；请使用官方安装器补齐依赖。", "ERROR")
-        return False
-    ok, _ = run_cmd([PY_EXE, "-s", "-c", "import whimbox; print('whimbox import OK')"], timeout=60)
+    verify_script = (
+        "import importlib.util, whimbox; "
+        "assert importlib.util.find_spec('whimbox.main') is not None, 'missing whimbox.main'; "
+        "print('whimbox import OK')"
+    )
+    ok, _ = run_cmd([PY_EXE, "-s", "-c", verify_script], timeout=60, cwd=APP_DIR)
     return ok
+
+
+def _load_scripts_state():
+    try:
+        state = _read_json(SCRIPTS_STATE)
+        if isinstance(state, dict):
+            return state
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def fetch_scripts_commit():
+    """Fetch latest commit SHA of WhimboxScripts (with ETag cache) for incremental sync."""
+    state = _load_scripts_state()
+    cached_sha = state.get("commit_sha") if isinstance(state.get("commit_sha"), str) else None
+    cached_etag = state.get("etag") if cached_sha and isinstance(state.get("etag"), str) else None
+
+    try:
+        data, new_etag, not_modified = _http_json_conditional(SCRIPTS_COMMIT_API, etag=cached_etag, timeout=10)
+        if not_modified and cached_sha:
+            return cached_sha, cached_etag
+        if isinstance(data, dict) and isinstance(data.get("sha"), str) and data["sha"]:
+            return data["sha"], new_etag
+    except (OSError, ValueError):
+        pass
+
+    for prefix in [p for p in get_proxies() if p]:
+        try:
+            data = http_json(prefix + SCRIPTS_COMMIT_API, timeout=10)
+            if isinstance(data, dict) and isinstance(data.get("sha"), str) and data["sha"]:
+                return data["sha"], None
+        except (OSError, ValueError):
+            pass
+    return None, None
 
 
 def download_scripts_archive():
     os.makedirs(DATA_DIR, exist_ok=True)
-    for prefix in PROXIES:
+    for prefix in get_proxies():
         fd, temporary = tempfile.mkstemp(prefix=".scripts-", suffix=".zip", dir=DATA_DIR)
         os.close(fd)
         try:
             log("拉取路线仓库：%s" % (prefix or "GitHub 直连"))
             request = urllib.request.Request(prefix + SCRIPTS_ARCHIVE_URL, headers={"User-Agent": UA})
-            with urllib.request.urlopen(request, timeout=25 if prefix else 12) as response, open(temporary, "wb") as output:
+            with urllib.request.urlopen(request, timeout=25 if prefix else 15) as response, open(temporary, "wb") as output:
                 total = 0
                 deadline = time.monotonic() + 90
                 while True:
@@ -651,6 +1131,8 @@ def download_scripts_archive():
             with zipfile.ZipFile(temporary) as archive:
                 if sum(item.file_size for item in archive.infolist()) > MAX_ARCHIVE_BYTES:
                     raise ValueError("路线归档解压大小超过限制")
+                if archive.testzip() is not None:
+                    raise ValueError("路线归档压缩包损坏")
                 scripts = {}
                 for entry in archive.infolist():
                     parts = entry.filename.split("/")
@@ -659,9 +1141,7 @@ def download_scripts_archive():
                     name = parts[1]
                     if not _safe_filename(name) or entry.file_size > MAX_SCRIPT_BYTES:
                         raise ValueError("路线文件名或大小异常")
-                    data = archive.read(entry)
-                    json.loads(data.decode("utf-8-sig"))
-                    scripts[name] = data
+                    scripts[name] = archive.read(entry)
             if not scripts:
                 raise ValueError("归档中没有有效路线脚本")
             return scripts
@@ -696,15 +1176,52 @@ def save_watchlist(names):
     })
 
 
+def _match_wanted_scripts(remote_files, only):
+    selected = {}
+    missing = set()
+    fold_map = {name.casefold(): name for name in remote_files}
+    for wanted in only:
+        if wanted in remote_files:
+            selected[wanted] = remote_files[wanted]
+        elif os.name == "nt" and wanted.casefold() in fold_map:
+            canonical = fold_map[wanted.casefold()]
+            selected[canonical] = remote_files[canonical]
+        else:
+            missing.add(wanted)
+    return selected, missing
+
+
+def _local_script_exists(name):
+    if os.path.isfile(os.path.join(SCRIPTS_DIR, name)):
+        return True
+    if os.name == "nt" and os.path.isdir(SCRIPTS_DIR):
+        target = name.casefold()
+        return any(entry.casefold() == target for entry in os.listdir(SCRIPTS_DIR))
+    return False
+
+
 def sync_scripts(force=False, only=None):
     # Validate the subscription before starting network/file operations.
     if only is not None and not all(_safe_filename(name) for name in only):
         raise ValueError("订阅名称无效")
+
+    remote_sha, remote_etag = fetch_scripts_commit()
+    if remote_sha and not force:
+        saved = _load_scripts_state()
+        if saved.get("commit_sha") == remote_sha:
+            if only:
+                if all(_local_script_exists(name) for name in only):
+                    log("路线仓库无新提交（%s），订阅脚本已是最新，跳过下载。" % remote_sha[:7])
+                    return {"added": 0, "updated": 0, "same": len(only), "failed": 0, "skipped_download": True}
+            else:
+                saved_files = saved.get("files") if isinstance(saved.get("files"), list) else []
+                if saved.get("scope") == "all" and saved_files and all(_local_script_exists(name) for name in saved_files):
+                    log("路线仓库无新提交（%s），全部 %d 条路线已是最新，跳过下载。" % (remote_sha[:7], len(saved_files)))
+                    return {"added": 0, "updated": 0, "same": len(saved_files), "failed": 0, "skipped_download": True}
+
     remote_files = download_scripts_archive()
     if only:
-        wanted = set(only)
-        missing = wanted - set(remote_files)
-        remote_files = {name: data for name, data in remote_files.items() if name in wanted}
+        remote_files, missing = _match_wanted_scripts(remote_files, only)
     else:
         missing = set()
     counts = {"added": 0, "updated": 0, "same": 0, "failed": len(missing)}
@@ -712,11 +1229,14 @@ def sync_scripts(force=False, only=None):
         log("订阅脚本在上游缺失：%s" % "、".join(sorted(missing)), "WARN")
     os.makedirs(SCRIPTS_DIR, exist_ok=True)
     backup = os.path.join(BACKUP_DIR, "scripts-%s-%s" % (datetime.now().strftime("%Y%m%d-%H%M%S"), uuid.uuid4().hex[:8]))
+    backed_up_any = False
     for name, remote in remote_files.items():
         try:
             if not _safe_filename(name):
                 raise ValueError("路线文件名无效")
-            json.loads(remote.decode("utf-8-sig"))
+            parsed = json.loads(remote.decode("utf-8-sig"))
+            if not isinstance(parsed, dict):
+                raise ValueError("路线 JSON 根节点应为对象")
             destination = os.path.join(SCRIPTS_DIR, name)
             if os.path.isfile(destination):
                 with open(destination, "rb") as source:
@@ -725,6 +1245,7 @@ def sync_scripts(force=False, only=None):
                     counts["same"] += 1
                     continue
                 atomic_write_bytes(os.path.join(backup, name), previous)
+                backed_up_any = True
                 action = "updated"
             else:
                 action = "added"
@@ -734,20 +1255,42 @@ def sync_scripts(force=False, only=None):
         except (OSError, ValueError) as exc:
             counts["failed"] += 1
             log("路线 %s 同步失败，原文件已保留：%s" % (name, exc), "ERROR")
+    if backed_up_any:
+        _prune_script_backups()
+    if remote_sha and counts["failed"] == 0:
+        atomic_write_json(SCRIPTS_STATE, {
+            "commit_sha": remote_sha,
+            "etag": remote_etag,
+            "scope": "only" if only else "all",
+            "files": sorted(remote_files.keys()),
+            "updated_at": datetime.now().isoformat(timespec="seconds"),
+        })
     log("路线同步：新增 %(added)d / 更新 %(updated)d / 相同 %(same)d / 失败 %(failed)d" % counts)
     return counts
+
+
+def _frontend_install_cmdline(exe_path, app_dir):
+    """Build NSIS silent installer command line. /D= must be final and unquoted per NSIS spec."""
+    target = os.path.abspath(app_dir)
+    if any(ord(ch) >= 128 for ch in target) or any(ch in target for ch in '"\r\n\x00'):
+        raise ValueError("官方前端安装器仅支持纯英文且不含引号的路径：%s" % target)
+    return '"%s" /S /D=%s' % (os.path.abspath(exe_path), target)
 
 
 def install_frontend(exe_path, expected_ver):
     if not os.path.isfile(exe_path):
         return False
-    log("正在静默安装前端，请等待安装进程结束。")
+    log("正在静默安装前端到 %s，请等待安装进程结束。" % APP_DIR)
     try:
-        process = subprocess.run([exe_path, "/S"], timeout=420, env=env_for_pip())
+        cmdline = _frontend_install_cmdline(exe_path, APP_DIR)
+        if os.name == "nt":
+            process = subprocess.run(cmdline, timeout=420, env=os.environ.copy())
+        else:
+            process = subprocess.run([exe_path, "/S", "/D=" + APP_DIR], timeout=420, env=os.environ.copy())
         if process.returncode != 0:
             log("前端安装器返回错误：%s" % process.returncode, "ERROR")
             return False
-    except (OSError, subprocess.TimeoutExpired) as exc:
+    except (OSError, ValueError, subprocess.TimeoutExpired) as exc:
         log("前端安装进程异常：%s" % exc, "ERROR")
         return False
     got = frontend_version()
@@ -790,6 +1333,24 @@ def _validate_app():
         raise ValueError("未找到奇想盒安装：%s。请放在安装目录内运行，或使用 --app-dir 指定安装目录。" % APP_DIR)
 
 
+def _needs_elevation(args):
+    if os.name != "nt" or args.no_elevate or args.check:
+        return False
+    if args.install_frontend:
+        return True
+    if args.rollback:
+        targets = [SITE_PACKAGES]
+    elif args.scripts_only:
+        targets = [SCRIPTS_DIR]
+    else:
+        targets = []
+        if not args.no_backend:
+            targets.append(SITE_PACKAGES)
+        if not args.no_scripts:
+            targets.append(SCRIPTS_DIR)
+    return not all(_dir_is_writable(path) for path in targets)
+
+
 def _parser():
     parser = argparse.ArgumentParser(description="Whimbox 奇想盒更新器（源码与 EXE 通用）")
     parser.add_argument("--version", action="version", version="Whimbox Updater " + VERSION)
@@ -797,13 +1358,18 @@ def _parser():
     parser.add_argument("--data-dir", help="配置、缓存、日志和备份目录；默认使用用户数据目录")
     parser.add_argument("--print-data-dir", action="store_true", help="输出数据目录路径并退出")
     parser.add_argument("--check", action="store_true", help="仅检查版本，不修改奇想盒安装（会保存日志与缓存）")
+    parser.add_argument("--no-backend", action="store_true", help="跳过后端 wheel 更新")
     parser.add_argument("--no-scripts", action="store_true", help="跳过路线同步")
+    parser.add_argument("--scripts-only", action="store_true", help="仅同步路线脚本，不更新前后端")
     parser.add_argument("--watch", metavar="名字,名字", help="设置订阅；空字符串表示全量")
     parser.add_argument("--all-scripts", action="store_true", help="本次忽略订阅，进行全量同步")
-    parser.add_argument("--edit-subscriptions", action="store_true", help="打开订阅配置，保存关闭后同步路线")
-    parser.add_argument("--force", action="store_true", help="相同版本也强制重装后端")
-    parser.add_argument("--install-frontend", action="store_true", help="同时安装新版前端（前端安装由官方安装器执行）")
+    parser.add_argument("--edit-subscriptions", action="store_true", help="打开订阅配置，保存关闭后仅同步路线")
+    parser.add_argument("--force", action="store_true", help="相同版本也强制重装后端或强制重拉路线")
+    parser.add_argument("--sync-deps", action="store_true", help="后端安装时允许从国内 PyPI 镜像同步第三方依赖（慎用）")
+    parser.add_argument("--install-frontend", action="store_true", help="同时安装新版前端（前端安装由官方 NSIS 安装器执行）")
     parser.add_argument("--rollback", action="store_true", help="恢复最近一次完整后端备份")
+    parser.add_argument("--direct", action="store_true", help="仅直连 GitHub，不使用第三方下载代理")
+    parser.add_argument("--proxy", action="append", metavar="URL", help="自定义 HTTPS 下载代理前缀（可多次指定）")
     parser.add_argument("--quiet", action="store_true", help="减少控制台输出，仍记录日志")
     parser.add_argument("--no-elevate", action="store_true", help="跳过自动提权，供已提权任务使用")
     parser.add_argument("--pause", action="store_true", help="完成后等待回车，供双击启动使用")
@@ -812,33 +1378,83 @@ def _parser():
 
 def _execute(args):
     _validate_app()
-    if args.check and (args.rollback or args.watch is not None or args.edit_subscriptions):
-        raise ValueError("--check 请单独使用，避免与配置或回滚操作混用。")
-    # Checking and editing user configuration do not require writing Program Files.
-    modifies_app = not args.check and not (args.watch is not None and args.no_scripts)
-    if modifies_app and not args.no_elevate:
-        ensure_admin()
+    if args.check and (args.rollback or args.watch is not None or args.edit_subscriptions
+                       or args.install_frontend or args.sync_deps):
+        raise ValueError("--check 请单独使用，避免与安装、配置或回滚操作混用。")
+    if args.scripts_only and (args.no_scripts or args.install_frontend or args.rollback):
+        raise ValueError("--scripts-only 不能与 --no-scripts、--install-frontend 或 --rollback 同时使用。")
+
     os.makedirs(DATA_DIR, exist_ok=True)
+
+    # Edit/save user configuration BEFORE any elevation so Notepad never runs as Administrator.
+    did_config_edit = False
+    if args.edit_subscriptions or args.watch is not None:
+        with UpdateLock(os.path.join(DATA_DIR, "updater.lock")):
+            _migrate_legacy_data()
+            if args.edit_subscriptions:
+                if os.name != "nt":
+                    raise ValueError("订阅编辑器入口用于 Windows；其他平台可直接编辑配置。")
+                if not os.path.isfile(WATCHLIST_FILE):
+                    save_watchlist([])
+                subprocess.run(["notepad.exe", WATCHLIST_FILE], check=True)
+                load_watchlist()  # Stop before elevation or sync if the saved JSON is invalid.
+                args.scripts_only = True
+                args.no_scripts = False
+                did_config_edit = True
+            if args.watch is not None:
+                names = [name.strip() for name in args.watch.replace("，", ",").split(",") if name.strip()]
+                names = [name if name.lower().endswith(".json") else name + ".json" for name in names]
+                save_watchlist(names)
+                log("订阅已保存：%s" % WATCHLIST_FILE)
+                if args.no_scripts or not names:
+                    return 0
+                args.scripts_only = True
+                did_config_edit = True
+
+    if _needs_elevation(args):
+        ensure_admin(strip_config_edit=did_config_edit)
+
     with UpdateLock(os.path.join(DATA_DIR, "updater.lock")):
         _migrate_legacy_data()
-        if args.edit_subscriptions:
-            if os.name != "nt":
-                raise ValueError("订阅编辑器入口用于 Windows；其他平台可直接编辑配置。")
-            if not os.path.isfile(WATCHLIST_FILE):
-                save_watchlist([])
-            subprocess.run(["notepad.exe", WATCHLIST_FILE], check=True)
-            load_watchlist()  # Stop before any sync if the saved JSON is invalid.
-            args.no_scripts = False
-        if args.watch is not None:
-            names = [name.strip() for name in args.watch.replace("，", ",").split(",") if name.strip()]
-            names = [name if name.lower().endswith(".json") else name + ".json" for name in names]
-            save_watchlist(names)
-            log("订阅已保存：%s" % WATCHLIST_FILE)
-            if args.no_scripts or not names:
-                return 0
+        _prune_logs()
         if args.rollback:
-            return 0 if rollback_backend(backend_version()) else 1
+            _ensure_whimbox_not_running()
+            ok = rollback_backend(backend_version())
+            save_state({
+                "run_id": uuid.uuid4().hex,
+                "backend_version": backend_version(),
+                "frontend_version": frontend_version(),
+                "status": "rolled_back" if ok else "failed",
+                **({"last_rollback": datetime.now().isoformat(timespec="seconds")}
+                   if ok else {"rollback_error": "手动回滚失败，请查看日志。"}),
+            })
+            return 0 if ok else 1
+        if args.scripts_only:
+            return _sync_scripts_only(args)
         return _update(args)
+
+
+def _sync_scripts_only(args):
+    result = {
+        "run_id": uuid.uuid4().hex,
+        "backend_version": backend_version(),
+        "frontend_version": frontend_version(),
+        "status": "success",
+    }
+    try:
+        only = None if args.all_scripts else (load_watchlist() or None)
+        result["scripts"] = sync_scripts(force=args.force, only=only)
+        if result["scripts"]["failed"]:
+            result["scripts_error"] = "%d 个路线脚本同步失败" % result["scripts"]["failed"]
+    except Exception as exc:
+        result["scripts_error"] = str(exc)
+        log("路线同步失败：%s" % exc, "ERROR")
+    failed = "scripts_error" in result
+    result["status"] = "failed" if failed else "success"
+    save_state(result)
+    log("%s。日志与状态目录：%s" % ("路线同步存在失败" if failed else "路线同步完成", DATA_DIR),
+        "ERROR" if failed else "INFO")
+    return 1 if failed else 0
 
 
 def _update(args):
@@ -846,33 +1462,55 @@ def _update(args):
     log("本地版本：后端 %s / 前端 %s" % (bver, fver))
     releases = fetch_releases()
     whl_release, wheel, wheel_version = pick_asset(releases, ".whl", [r"whimbox-([\d.]+)-py3-none-any\.whl"])
-    _, executable, exe_version = pick_asset(releases, ".exe", [r"whimbox_app-setup-([\d.]+)\.exe"])
-    if wheel is None:
+    exe_release, executable, exe_version = pick_asset(releases, ".exe", [r"whimbox_app-setup-([\d.]+)\.exe"])
+    if wheel is None and not args.no_backend:
         raise RuntimeError("Release 中没有找到有效后端 wheel；已保留当前安装。")
     result = {"run_id": uuid.uuid4().hex, "backend_version": bver, "frontend_version": fver,
               "latest_release": releases[0].get("tag_name"), "latest_whl": wheel_version,
               "latest_exe": exe_version, "status": "success"}
-    need_backend = args.force or vtuple(wheel_version) > vtuple(bver)
-    need_frontend = executable is not None and vtuple(exe_version) > vtuple(fver)
-    log("远端版本：后端 %s / 前端 %s" % (wheel_version, exe_version or "无安装包"))
+    need_backend = (not args.no_backend) and (wheel is not None) and (args.force or vtuple(wheel_version) > vtuple(bver))
+    need_frontend = executable is not None and (
+        vtuple(exe_version) > vtuple(fver) or (args.install_frontend and args.force)
+    )
+    log("远端版本：后端 %s / 前端 %s" % (wheel_version or "无安装包", exe_version or "无安装包"))
+
+    if need_backend and whl_release:
+        notes = _summarize_release_notes(whl_release.get("body"))
+        if notes:
+            log("后端 %s 更新说明：" % wheel_version)
+            for line in notes:
+                log("  " + line)
+    if need_frontend and exe_release and exe_release is not whl_release:
+        notes = _summarize_release_notes(exe_release.get("body"))
+        if notes:
+            log("前端 %s 更新说明：" % exe_version)
+            for line in notes:
+                log("  " + line)
+
     if args.check:
         result["backend_update_available"] = need_backend
         result["frontend_update_available"] = need_frontend
         save_state(result)
         log("检查完成，奇想盒安装未修改。")
         return 0
+
+    if need_backend or (args.install_frontend and need_frontend):
+        _ensure_whimbox_not_running()
+
+    protected_downloads = []
     if need_backend:
         backup = None
         installation_started = False
         try:
             destination = os.path.join(DOWNLOAD_DIR, wheel["name"])
+            protected_downloads.append(destination)
             verified_version = download_asset(wheel["browser_download_url"], destination,
                                               wheel.get("size"), asset_digest(wheel), is_whl=True)
             if verified_version and vtuple(verified_version) != vtuple(wheel_version):
                 raise ValueError("wheel 内部版本与文件名不一致，已停止安装。")
             backup = backup_backend(bver)
             installation_started = True
-            if not install_whl(destination, force=args.force):
+            if not install_whl(destination, force=args.force, sync_deps=args.sync_deps):
                 raise RuntimeError("后端安装或健康检查失败")
             got = backend_version()
             if vtuple(got) != vtuple(wheel_version):
@@ -890,41 +1528,51 @@ def _update(args):
             else:
                 log("安装尚未开始，当前后端保持原状。")
             result["backend_version"] = backend_version()
-    else:
+    elif not args.no_backend:
         log("后端已是最新版本。")
+
     if args.install_frontend and need_frontend:
         try:
             destination = os.path.join(DOWNLOAD_DIR, executable["name"])
+            protected_downloads.append(destination)
             download_asset(executable["browser_download_url"], destination,
                            executable.get("size"), asset_digest(executable))
             if not install_frontend(destination, exe_version):
                 raise RuntimeError("前端安装器或安装后版本验证失败")
             result["frontend_version"] = frontend_version()
+            result["last_frontend_update"] = datetime.now().isoformat(timespec="seconds")
         except Exception as exc:
             result["frontend_error"] = str(exc)
             log("前端更新失败：%s" % exc, "ERROR")
+    elif args.install_frontend:
+        log("前端已是最新版本。")
     elif need_frontend:
-        log("前端可更新至 %s；需要时添加 --install-frontend。" % exe_version)
+        log("前端可更新至 %s；可运行 update_frontend.bat 或添加 --install-frontend 更新前端。" % exe_version)
+
+    if protected_downloads:
+        _prune_downloads(protected=protected_downloads)
+
     if not args.no_scripts:
         try:
             only = None if args.all_scripts else (load_watchlist() or None)
-            result["scripts"] = sync_scripts(only=only)
+            result["scripts"] = sync_scripts(force=args.force, only=only)
             if result["scripts"]["failed"]:
                 result["scripts_error"] = "%d 个路线脚本同步失败" % result["scripts"]["failed"]
         except Exception as exc:
             result["scripts_error"] = str(exc)
             log("路线同步失败：%s" % exc, "ERROR")
+
     failed = any(key in result for key in ("backend_error", "frontend_error", "scripts_error", "rollback_error"))
     result["status"] = "failed" if failed else "success"
     save_state(result)
     log("%s。日志与状态目录：%s" % ("本次存在失败步骤" if failed else "更新完成", DATA_DIR), "ERROR" if failed else "INFO")
-    if need_backend and "backend_error" not in result:
-        log("请重启奇想盒以使用新版后端。")
+    if (need_backend and "backend_error" not in result) or (args.install_frontend and need_frontend and "frontend_error" not in result):
+        log("请重启奇想盒以使用新版本。")
     return 1 if failed else 0
 
 
 def main():
-    global QUIET
+    global QUIET, _DIRECT_ONLY, _CUSTOM_PROXIES
     args = _parser().parse_args()
     QUIET = args.quiet
     # Preserve explicitly configured module paths for embedding/tests; normal CLI
@@ -936,6 +1584,19 @@ def main():
         return 0
     log("Whimbox Updater %s" % VERSION)
     try:
+        if args.direct and args.proxy:
+            raise ValueError("--direct 与 --proxy 不能同时使用。")
+        _DIRECT_ONLY = bool(args.direct)
+        _CUSTOM_PROXIES = None
+        if args.proxy:
+            normalized = []
+            for entry in args.proxy:
+                for item in entry.split(","):
+                    normalized.append(_normalize_proxy_url(item))
+            normalized = list(dict.fromkeys(normalized))
+            if "" not in normalized:
+                normalized.append("")
+            _CUSTOM_PROXIES = normalized
         return _execute(args)
     except (OSError, ValueError, RuntimeError, subprocess.SubprocessError) as exc:
         log(str(exc), "ERROR")

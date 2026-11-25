@@ -1,5 +1,29 @@
 # 更新记录
 
+## v1.2.0
+
+### 前后端分离适配与运行安全
+
+- 新增运行中进程检测：更新或回滚前通过 Win32 API 检测目标安装目录下正在运行的 `whimbox_app.exe` 与内置 `python.exe`（自动排除更新器自身与父进程链），防止文件锁导致半成品残局。
+- 新增 `update_frontend.bat` 与 `--no-backend` / `--scripts-only` 独立入口，契合奇想盒 Electron 前端与 Python 后端分离发布结构；前端静默安装支持通过 NSIS `/D=` 参数精准覆盖自定义安装目录，并校验纯英文路径约束。
+- 后端运行环境与官方 `WindowsPythonEnvironmentService` 对齐：隔离 `PYTHONHOME`、`PATH` 并清理 `PYTHONPATH` 与 PyInstaller 运行时变量；安装后健康检查在 `APP_DIR` 下验证 `whimbox` 与 `whimbox.main` 入口。
+- 默认后端安装维持 `--no-deps` + `pip check` 事务安全策略；依赖检查失败时提取具体冲突包名，并新增显式可选 `--sync-deps` 参数（通过国内 PyPI 镜像同步第三方依赖）或提示在奇想盒设置中手动安装已下载 wheel。
+- 改进 `app.asar` 版本解析（按 ASAR 头部 `json_size` 精确读取），并在检查与更新日志中展示新版 Release 更新说明摘要。
+
+### 安全校验、网络与增量路线同步
+
+- GitHub Releases 查询支持 `ETag` / `If-None-Match`（304 不消耗 API 额度）及可选 `GITHUB_TOKEN`（仅发往官方 `api.github.com`，绝不透传给第三方代理）。
+- 当直连 GitHub API 失败回退至第三方代理时，自动对多代理返回的安装包 SHA256 摘要做交叉一致校验，摘要不一致或伪造版本时立即中止。
+- 支持 `--direct`、`--proxy` 与 `WHIMBOX_PROXIES` 自定义代理策略；下载过程改为单遍流式计算 SHA256 并输出下载进度。
+- 路线同步接入 `WhimboxScripts` 最新提交 `SHA` 与 `scripts_state.json` 增量缓存，上游无新提交且本地文件齐全时跳过 `main.zip` 下载；单条异常路线不再中断整批拉取，Windows 下支持订阅名大小写不敏感匹配。
+
+### 权限、磁盘维护与构建流
+
+- 按需提权：写入目录当前用户可写且无需安装前端时不再弹出 UAC；`--edit-subscriptions` 与 `--watch` 移至提权前执行，避免以管理员权限打开记事本，且仅触发路线同步。
+- 修复 `install_task.bat` 提权时丢失命令行参数与原用户 `%LOCALAPPDATA%` 的问题，`install_task.ps1` 新增 `-Time` 参数自定义计划任务时间。
+- 自动清理旧日志（保留 14 天）、旧下载包（各保留 3 份）与旧路线备份（保留 10 份）；备份排序优先依据 `backup.json` 创建时间，文件替换与删除增加短暂 Windows 锁重试退避；手动 `--rollback` 同步刷新 `state.json`。
+- 新增跨平台 `CI` 工作流（Ubuntu + Windows 单测与格式校验）；Release 工作流改为从 `CHANGELOG.md` 自动提取发布说明并在 `ubuntu-latest` 创建草稿 Release；构建脚本自动从 `requirements-build.txt` 读取 PyInstaller 版本。
+
 ## v1.1.0
 
 ### Windows EXE 与云端构建
