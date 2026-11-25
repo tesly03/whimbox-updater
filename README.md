@@ -1,60 +1,79 @@
-# Whimbox 奇想盒 · 免费自动更新器
+# Whimbox 奇想盒更新器
 
-依据奇想盒官方文档「手动更新奇想盒和路线」实现的**免费**替代方案——无需开通付费的「自动更新」会员，即可自动把后端、前端、跑图路线脚本保持在最新版本。
+自动执行奇想盒公开的手动更新步骤：检查 GitHub Releases、安装后端 wheel、同步公开路线脚本，并按需运行官方前端安装器。
 
-> 奇想盒（Whimbox）本身是开源免费的；付费会员仅提供官方自动更新与脚本订阅。本工具走的是官方文档给出的手动更新路径，不涉及任何破解。
+**v1.1.0 支持 Windows EXE：电脑上无需额外安装 Python。** EXE 在 GitHub Actions 的 Windows 构建机上生成，本机只运行更新器。
 
-## 能做什么
+## 下载与运行
 
-1. 查询 GitHub Releases 最新版本（直连 + 国内镜像多通道，自动规避墙与 API 限流）
-2. 自动下载后端 `.whl`，用奇想盒内置 Python/pip 安装（等价于 APP 里的「手动更新后端」）
-3. 自动同步 `nikkigallery/WhimboxScripts` 跑图路线脚本（可配「我的订阅」只跟指定脚本）
-4. 可选：下载并静默安装前端 `whimbox_app-setup-x.y.z.exe`
-5. 全程 sha256 校验 + 备份 + 失败自动回滚，支持手动回滚
+在 [Releases](https://github.com/tesly03/whimbox-updater/releases) 下载最新的 `whimbox-updater-vX.Y.Z-windows-x64.zip`，解压到奇想盒安装目录内，例如：
 
-只依赖 Python 标准库，直接用奇想盒自带的内置 Python 运行，无需额外安装。
-
-## 快速开始（解压即用）
-
-1. 到本仓库 **Releases** 下载最新的 `whimbox-updater-vX.Y.Z.zip`。
-2. 解压到奇想盒安装目录内的任意一个文件夹，例如：
-
-   ```
-   C:\Program Files\whimbox_app\whimbox-updater\
-   ```
-
-   路径会自动推断：脚本会从自身所在位置向上查找奇想盒安装根目录
-   （识别 `python-embedded\` 与 `resources\app.asar`），**无需修改任何配置**。
-   即使奇想盒装在 D 盘等非默认位置也能直接使用。
-
-3. 双击对应的 bat 即可：
-
-| 文件 | 作用 |
-|---|---|
-| `update_now.bat` | 一键更新（后端 + 路线脚本） |
-| `check_only.bat` | 只看版本，不改任何文件 |
-| `rollback.bat` | 回滚后端到最近一次备份 |
-| `subscriptions.bat` | 编辑「我的订阅」清单（只更新指定的脚本） |
-| `install_task.bat` | 注册「每天 09:00 自动检查更新」的 Windows 计划任务 |
-
-## 命令行用法
-
-```bash
-python whimbox_updater.py --check              # 仅检查版本，不改动
-python whimbox_updater.py                      # 更新后端 + 同步脚本（推荐）
-python whimbox_updater.py --install-frontend   # 同时静默安装新版前端 exe
-python whimbox_updater.py --no-scripts         # 不同步跑图路线
-python whimbox_updater.py --force              # 已是最新也强制重装
-python whimbox_updater.py --rollback           # 回滚到最近一次后端备份
-python whimbox_updater.py --watch "家园日常,朝夕心愿_采集"   # 设置订阅清单
-python whimbox_updater.py --watch ""           # 清空订阅清单，恢复全量
-python whimbox_updater.py --all-scripts        # 本次忽略订阅清单，全量同步
-python whimbox_updater.py --help               # 查看全部参数
+```text
+C:\Program Files\whimbox_app\whimbox-updater\
 ```
 
-## 「我的订阅」清单
+双击 `update_now.bat` 或 `whimbox-updater.exe`。更新器从所在位置向上查找 `python-embedded\python.exe` 和 `resources\app.asar`。安装在其他盘符也适用。写入安装目录时会申请管理员权限；更新前请退出奇想盒，完成后重新启动。
 
-`_data/watchlist.json`（首次运行自动生成）里的 `scripts` 列表，只更新这里列出的脚本：
+Windows x64 EXE 面向 Windows 10/11。它包含更新器自己的 Python 运行时；安装后端仍使用奇想盒原有的内置 Python，更新器不会重新打包奇想盒程序文件。
+
+独立 EXE 也可放在其他目录，用命令行指定奇想盒的位置：
+
+```powershell
+.\whimbox-updater.exe --app-dir "D:\Apps\whimbox_app"
+```
+
+源码用户下载 source ZIP，将更新器放入安装目录后，通过原有 BAT 或内置 Python 运行即可，无第三方运行依赖。
+
+## 常用入口
+
+| 入口 | 作用 |
+| --- | --- |
+| `update_now.bat` | 更新后端并同步路线 |
+| `check_only.bat` | 仅检查版本，保留安装不变 |
+| `rollback.bat` | 从最近一次完整备份恢复后端 |
+| `subscriptions.bat` | 编辑订阅，保存并关闭记事本后同步 |
+| `install_task.bat` | 安装每日 09:00 自动更新任务 |
+
+BAT 优先启动同目录 EXE；源码包则查找奇想盒的内置 Python。退出码会保留，失败时控制台显示错误。
+
+## 更新与恢复
+
+- 安装包必须通过 GitHub Release 提供的 SHA256 校验；缺少校验值时停止安装。
+- 下载和备份失败时，现有后端保持原状。只有安装已开始且本次完整备份可用时才执行自动回滚。
+- 备份先写入临时目录，完整后才登记；恢复前检查文件摘要，恢复时保留当前目录供失败撤回。
+- 后端 pip 安装使用 `--no-deps`，保留现有依赖；安装后执行 `pip check` 与 `import whimbox`。如果新版本需要尚未安装的依赖，将恢复旧后端，并提示通过官方安装器补齐依赖后重试。
+- 路线、配置和状态文件使用同目录临时文件及原子替换。路线写入失败时保留原文件；已有同名路线被更新前会备份。
+- 同一数据目录的更新、回滚和计划任务使用进程锁，避免默认路径下重复执行。
+- 前端安装、路线同步或后端更新任一步失败，整体退出码为非零，计划任务可以识别失败。
+
+前端安装由官方 NSIS 安装器执行，前端程序本身不在后端备份的恢复范围。安装中断时请检查日志，必要时重新运行官方安装器。
+
+## 官方前端与后端
+
+奇想盒由 [Electron 前端](https://github.com/nikkigallery/whimbox_app) 和 [Python 后端](https://github.com/nikkigallery/Whimbox) 组成，前端使用安装目录内的 `python-embedded` 启动后端。前端仓库已说明，后续安装包统一发布到 [后端 Releases](https://github.com/nikkigallery/Whimbox/releases)。更新器分别选择最新可用 wheel 和前端安装器，不假定每次 Release 都同时提供两种附件，前后端版本也不要求相同。
+
+默认只更新后端与路线；`--install-frontend` 才运行官方前端安装器。官方安装脚本会保留 Python 环境、配置和路线等用户数据。本工具使用公开 Release 与脚本仓库，无需登录奇想盒，也不访问其会员自动更新接口。
+
+## 配置、日志与备份
+
+v1.1.0 默认将数据移到当前用户可写的位置，按奇想盒安装路径分别存储：
+
+```text
+%LOCALAPPDATA%\WhimboxUpdater\<安装路径标识>\
+  watchlist.json
+  state.json
+  downloads\
+  logs\
+  backups\
+```
+
+运行时会输出实际路径。使用 `--data-dir "D:\WhimboxUpdaterData"` 可指定固定目录；手动运行和计划任务应使用相同目录。请保留该目录以便恢复后端。
+
+更新器会从同目录旧版 `_data` 自动迁移订阅和 Release 缓存，并继续识别旧备份；迁移保留旧文件。新后端备份自动保留最近 3 份。路线备份暂由用户按需清理。
+
+## 我的订阅
+
+双击 `subscriptions.bat`，在记事本中填写：
 
 ```json
 {
@@ -62,30 +81,69 @@ python whimbox_updater.py --help               # 查看全部参数
 }
 ```
 
-- 留空 `[]` 或删除该文件 → 全量同步所有脚本（默认）。
-- 可用脚本名见 `C:\Program Files\whimbox_app\scripts\*.json`。
+`scripts: []` 表示全量同步。JSON 错误、类型错误或无效文件名会停止本次路线同步，避免意外扩大范围。路线名在上游缺失时会报告失败。同步保留仓库里没有的本地文件；同名文件仍视为上游维护的路线，因此自定义路线请使用独立名称。
 
-## 配置
+## 命令行
 
-路径已经全部自动推断，一般**无需改动**。需要调整的参数在 `whimbox_updater.py` 顶部「配置区」：
+以下参数也适用于 `python whimbox_updater.py`：
 
-- `APP_DIR` — 奇想盒安装目录（默认 `C:\Program Files\whimbox_app`）
-- `PROXIES` — GitHub 镜像通道列表（默认已按可用性排序）
-- `PIP_MIRRORS` — pip 国内源列表
+```powershell
+.\whimbox-updater.exe --version
+.\whimbox-updater.exe --check
+.\whimbox-updater.exe --no-scripts
+.\whimbox-updater.exe --force
+.\whimbox-updater.exe --install-frontend
+.\whimbox-updater.exe --rollback
+.\whimbox-updater.exe --watch "家园日常,朝夕心愿_采集"
+.\whimbox-updater.exe --watch ""
+.\whimbox-updater.exe --all-scripts
+.\whimbox-updater.exe --edit-subscriptions
+.\whimbox-updater.exe --app-dir "D:\Apps\whimbox_app" --data-dir "D:\UpdaterData"
+.\whimbox-updater.exe --help
+```
 
-## 注意事项
+`--force` 会向 pip 传入 `--force-reinstall`，依赖仍保持不变。`--check` 只保留日志、缓存与检查状态，不更新奇想盒安装。无参数双击 EXE 后会等待回车，便于查看结果；`--pause` 可为其他命令启用相同行为。
 
-- 更新前请**先关闭奇想盒 APP**，更新完成后**重启**，新后端才会生效。
-- 下载依赖国内 GitHub 镜像，全部不可达时会回退到本地缓存/离线安装。
-- 更新器放在安装目录内，卸载/重装奇想盒前请先备份 `_data\backups\`。
+## 计划任务
 
-## 免责声明（重要）
+双击 `install_task.bat`，默认安装每日 09:00 运行的 `WhimboxAutoUpdate`。任务优先使用 EXE，使用最高权限、与交互运行一致的数据目录，并限制同一任务并发实例。建议先手动完成一次更新，再启用定时任务。
 
-- 本工具**仅自动化奇想盒官方文档公开的手动更新步骤**，不包含、也不分发奇想盒的任何程序文件（不含 `.exe`、`.whl` 等二进制产物），不逆向、不破解、不绕过奇想盒的任何付费功能或服务端鉴权。
-- 版本信息来自 GitHub 公开 Releases，脚本来自公开仓库 `nikkigallery/WhimboxScripts`，均为公开资源；本工具不访问、不依赖奇想盒的付费「自动更新 / 脚本订阅」接口。
-- 奇想盒（Whimbox）及其脚本、安装包、商标的著作权均归原作者所有。**请支持正版**；如需官方自动更新与脚本订阅服务，请通过官方渠道开通。
-- 本项目与奇想盒官方无任何关联，作者不对使用本工具造成的任何后果负责。
+删除任务：
 
-## 许可
+```powershell
+Unregister-ScheduledTask -TaskName WhimboxAutoUpdate -Confirm:$false
+```
+
+## GitHub 云端打包
+
+推送 `vX.Y.Z` 标签后，[Build and release 工作流](https://github.com/tesly03/whimbox-updater/actions) 在 Windows x64 上：
+
+1. 使用 Python 3.12 运行标准库回归测试。
+2. 安装固定版本 PyInstaller，构建单文件控制台 EXE。
+3. 执行 EXE 的 `--version` 和 `--help` 冒烟测试。
+4. 打包 Windows 便携 ZIP、源码 ZIP、独立 EXE 及 `SHA256SUMS.txt`。
+5. 上传构建产物，并创建草稿 Release，供维护者核对后发布。
+
+也可在 Actions 页面手动运行工作流进行构建。构建使用 GitHub 自动提供的短期 `GITHUB_TOKEN`，源码中无需配置个人令牌。个人电脑无需安装打包工具。
+
+校验下载文件：
+
+```powershell
+Get-FileHash .\whimbox-updater.exe -Algorithm SHA256
+```
+
+将输出与同版本的 `SHA256SUMS.txt` 对比。EXE 暂未做商业代码签名，Windows SmartScreen 可能提示未知发布者；请从本仓库 Release 获取并核对摘要。
+
+开发测试：
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+## 项目说明与许可
+
+本工具仅自动化奇想盒官方文档公开的手动更新步骤，不包含或分发奇想盒的 EXE、wheel 等程序文件。版本与安装包来自 `nikkigallery/Whimbox` 的公开 Releases，路线来自公开仓库 `nikkigallery/WhimboxScripts`，不依赖官方付费自动更新和订阅接口。
+
+本项目与奇想盒官方无关联。奇想盒及相关脚本、安装包和商标属于其原作者。请备份自己的配置与路线，支持原作者。
 
 [MIT License](LICENSE)

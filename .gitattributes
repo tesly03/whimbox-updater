@@ -1,5 +1,5 @@
 # 批处理文件必须原样保留 CRLF（Windows cmd.exe 依赖 CRLF 换行），
 # -text 表示 git 完全不做换行符转换。
-*.bat -text
+*.bat -text whitespace=cr-at-eol
 *.ps1 -text
 *.py  text eol=lf

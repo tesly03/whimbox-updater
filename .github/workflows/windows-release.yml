@@ -1,0 +1,128 @@
+name: Windows x64 release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to build (must match VERSION in whimbox_updater.py)
+        required: true
+        type: string
+        default: '1.1.0'
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.12 x64
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          architecture: x64
+
+      - name: Resolve and validate release version
+        id: version
+        shell: pwsh
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          if ($env:GITHUB_EVENT_NAME -eq 'push') {
+            if ($env:GITHUB_REF_NAME -notmatch '\Av(?<version>[0-9]+\.[0-9]+\.[0-9]+)\z') {
+              throw "Tag must have the form vMAJOR.MINOR.PATCH: $env:GITHUB_REF_NAME"
+            }
+            $version = $Matches.version
+          } else {
+            $version = $env:INPUT_VERSION
+          }
+          if ($version -notmatch '\A[0-9]+\.[0-9]+\.[0-9]+\z') {
+            throw "Version must have the form MAJOR.MINOR.PATCH: $version"
+          }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Install pinned build dependency
+        run: python -m pip install --disable-pip-version-check -r requirements-build.txt
+
+      - name: Build and package Windows x64 release
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: ./tools/build_windows.ps1 -Version $env:RELEASE_VERSION -OutputDirectory release-assets
+
+      - name: Smoke-test standalone executable
+        shell: pwsh
+        env:
+          RELEASE_VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          $exe = Join-Path $PWD "release-assets/whimbox-updater-v$env:RELEASE_VERSION.exe"
+          if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) { throw "Missing standalone executable: $exe" }
+          $versionOutput = & $exe --version
+          if ($LASTEXITCODE -ne 0 -or ($versionOutput -join "`n").Trim() -ne "Whimbox Updater $env:RELEASE_VERSION") {
+            throw "--version smoke test failed (exit $LASTEXITCODE): $versionOutput"
+          }
+          & $exe --help | Out-Host
+          if ($LASTEXITCODE -ne 0) { throw "--help smoke test failed (exit $LASTEXITCODE)" }
+          $dataDir = & $exe --print-data-dir
+          if ($LASTEXITCODE -ne 0 -or [string]::IsNullOrWhiteSpace(($dataDir -join "`n"))) {
+            throw "--print-data-dir smoke test failed (exit $LASTEXITCODE)"
+          }
+
+      - name: Upload release assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-x64-release-assets
+          path: release-assets/*
+          if-no-files-found: error
+          retention-days: 14
+
+  draft-release:
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release assets
+        uses: actions/download-artifact@v4
+        with:
+          name: windows-x64-release-assets
+          path: release-assets
+
+      - name: Create draft GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          $tag = $env:GITHUB_REF_NAME
+          $version = $env:RELEASE_VERSION
+          if ($tag -ne "v$version") { throw "Tag $tag does not match built version $version" }
+          $expectedNames = @(
+            "whimbox-updater-v$version.exe",
+            "whimbox-updater-v$version-windows-x64.zip",
+            "whimbox-updater-v$version-source.zip",
+            'SHA256SUMS.txt'
+          )
+          $assetFiles = @(Get-ChildItem -LiteralPath release-assets -File)
+          if ($assetFiles.Count -ne $expectedNames.Count) { throw "Expected exactly EXE, portable ZIP, source ZIP and SHA256SUMS.txt; found $($assetFiles.Count)" }
+          $assets = @(foreach ($name in $expectedNames) {
+            $path = Join-Path $PWD "release-assets/$name"
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { throw "Missing release asset: $name" }
+            $path
+          })
+          gh release create $tag @assets --repo $env:GITHUB_REPOSITORY --verify-tag --draft --title "Whimbox Updater $version" --notes "Windows x64 standalone updater. Verify downloads with SHA256SUMS.txt."
+          if ($LASTEXITCODE -ne 0) { throw "Draft release creation failed (exit $LASTEXITCODE)" }
